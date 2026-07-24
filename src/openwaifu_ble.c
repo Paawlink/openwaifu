@@ -20,8 +20,9 @@
 /** 广播中使用的 16-bit Service UUID（0xFD50 为涂鸦标准 GATT 服务）。 */
 #define OPENWAIFU_BLE_ADV_SVC_UUID 0xFD50
 
-/** 接收命令行 FIFO 的容量（一次 resync 可能连续下发“清空 + 多条会话”）。 */
-#define OPENWAIFU_BLE_QUEUE_LEN    16
+/** 接收命令行 FIFO 的容量（一次快照对账会连续下发 B + 多条会话 + E，
+ * 预留足够余量以免与重连 resync（清空 + 多条会话）重叠时丢失命令）。 */
+#define OPENWAIFU_BLE_QUEUE_LEN    24
 
 /***********************************************************
  ***********************变量定义****************************

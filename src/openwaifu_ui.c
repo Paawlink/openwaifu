@@ -11,14 +11,19 @@
  *   4-6 个任务 -> 火力全开   （会话列表）
  *   >6 个任务  -> 要炸了     （会话列表）
  *
- * 每个会话展示：状态（思考中/编码中/测试中/出错/完成）、任务文本、以及已运行
- * 时长。时长在本地按秒实时跳动，无需依赖推送频率。
+ * 界面采用横屏布局（480x320）。列表中每个会话以“任务主题简介”为主体（占据行
+ * 左侧大部分空间），状态（思考中/编码中/测试中/出错/完成）与已运行时长统一放在
+ * 行右侧。为避免会话增删导致顺序反复跳动，列表按会话 ID（Topic）稳定排序。
+ * 时长在本地按秒实时跳动，无需依赖推送频率。
  *
  * 数据来源：BLE 模块按 FIFO 暂存来自守护进程的命令行，UI 定时器逐条取出解析：
  *   C                                  清空所有会话
  *   X|<sid>                            移除某会话（完成/中止/超时）
  *   S|<sid>|<st>|<elapsed>|<plugin>|<task>  新增或更新某会话
+ *   B                                  快照同步开始（把现有会话标记为“未见”）
+ *   E                                  快照同步结束（移除本轮未再出现的会话）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
+ * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
  *
  * @copyright Copyright (c) 2021-2024 Tuya Inc. All Rights Reserved.
  */
@@ -81,6 +86,7 @@ typedef enum {
 /** 单个会话的本地状态与其绑定的 LVGL 标签。 */
 typedef struct {
     bool        used;
+    bool        seen;         /* 快照同步标记：B 置为 false，S 置为 true，E 时 false 则移除 */
     char        sid[OPENWAIFU_UI_SID_LEN];
     char        plugin[OPENWAIFU_UI_PLUGIN_LEN];
     char        task[OPENWAIFU_UI_TASK_LEN];
@@ -260,18 +266,6 @@ static ui_session_t *__find_session(const char *sid)
     return NULL;
 }
 
-static ui_session_t *__first_used(void)
-{
-    uint16_t i;
-
-    for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
-        if (sg_sessions[i].used) {
-            return &sg_sessions[i];
-        }
-    }
-    return NULL;
-}
-
 static ui_session_t *__alloc_session(const char *sid)
 {
     uint16_t i;
@@ -313,6 +307,34 @@ static void __remove_session(const char *sid)
     }
 }
 
+/** 快照同步开始：把所有现有会话标记为“未见”，等待本轮 S 命令重新点亮。 */
+static void __sync_begin(void)
+{
+    uint16_t i;
+
+    for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
+        if (sg_sessions[i].used) {
+            sg_sessions[i].seen = false;
+        }
+    }
+}
+
+/** 快照同步结束：移除本轮未再出现（仍为“未见”）的会话，使列表与状态对齐。 */
+static void __sync_end(void)
+{
+    uint16_t i;
+
+    for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
+        if (sg_sessions[i].used && !sg_sessions[i].seen) {
+            sg_sessions[i].used         = false;
+            sg_sessions[i].status_label = NULL;
+            sg_sessions[i].task_label   = NULL;
+            sg_sessions[i].timer_label  = NULL;
+            sg_structure_dirty          = true;
+        }
+    }
+}
+
 static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
                              const char *plugin, const char *task)
 {
@@ -334,6 +356,7 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     s->done         = (st == ST_IDLE);
     s->base_elapsed = elapsed;
     s->recv_tick    = lv_tick_get();
+    s->seen         = true; /* 本轮快照中出现过，E 时不会被清除 */
 
     /* 仅“新增”会改变会话数量/档位，需要整体重建；纯状态更新走原地重绘。 */
     if (is_new) {
@@ -358,6 +381,16 @@ static void __ui_handle_line(char *line)
 
     if (cmd == 'C' && line[1] == '\0') {
         __clear_sessions();
+        return;
+    }
+
+    if (cmd == 'B' && line[1] == '\0') {
+        __sync_begin();
+        return;
+    }
+
+    if (cmd == 'E' && line[1] == '\0') {
+        __sync_end();
         return;
     }
 
@@ -437,7 +470,12 @@ static void __paint_session(ui_session_t *s)
         lv_obj_set_style_text_color(s->status_label, col, 0);
     }
     if (s->task_label != NULL) {
-        lv_label_set_text(s->task_label, s->task[0] != '\0' ? s->task : "—");
+        /* 行主体优先显示任务主题；任务文本为空时回退到插件（Topic）名，
+         * 避免主体长期只显示占位符。 */
+        const char *body = s->task[0] != '\0' ? s->task : (s->plugin[0] != '\0' ? s->plugin : "—");
+        lv_label_set_text(s->task_label, body);
+        /* 行主体（任务主题）固定用白色，保证在深色卡片上清晰可读。 */
+        lv_obj_set_style_text_color(s->task_label, lv_color_hex(COL_TEXT), 0);
     }
     if (s->timer_label != NULL) {
         __fmt_elapsed(__session_elapsed(s), buf, sizeof(buf));
@@ -490,68 +528,35 @@ static void __build_sleep(void)
     lv_obj_set_style_text_color(hint, lv_color_hex(COL_TEXT_SUB), 0);
 }
 
-/** 单任务视图：更华丽的大卡片，突出大号计时器。 */
-static void __build_single(void)
-{
-    ui_session_t *s = __first_used();
-    lv_obj_t     *card;
-    lv_obj_t     *hdr;
-    lv_obj_t     *plugin;
-    lv_obj_t     *cap;
-
-    if (s == NULL) {
-        return;
-    }
-
-    card = __make_card(sg_root);
-    lv_obj_set_width(card, LV_PCT(100));
-    lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(card, 10, 0);
-
-    /* 顶部：状态标签（左）+ 插件名（右） */
-    hdr = __make_plain(card);
-    lv_obj_set_width(hdr, LV_PCT(100));
-    lv_obj_set_height(hdr, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    s->status_label = lv_label_create(hdr);
-
-    plugin = lv_label_create(hdr);
-    lv_label_set_text(plugin, s->plugin);
-    lv_obj_set_style_text_color(plugin, lv_color_hex(COL_TEXT_SUB), 0);
-
-    /* 计时说明 + 大号计时器 */
-    cap = lv_label_create(card);
-    lv_label_set_text(cap, "已运行");
-    lv_obj_set_style_text_color(cap, lv_color_hex(COL_TEXT_SUB), 0);
-
-    s->timer_label = lv_label_create(card);
-    lv_obj_set_style_text_font(s->timer_label, __font_big(), 0);
-
-    /* 任务文本：居中换行 */
-    s->task_label = lv_label_create(card);
-    lv_obj_set_width(s->task_label, LV_PCT(100));
-    lv_label_set_long_mode(s->task_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(s->task_label, LV_TEXT_ALIGN_CENTER, 0);
-
-    __paint_session(s);
-}
-
-/** 多任务视图：每个会话固定占一行。 */
+/** 会话列表视图：每个会话固定占一行，任务主题为主体、状态与时长靠右。 */
 static void __build_list(void)
 {
-    uint16_t i;
+    ui_session_t *order[OPENWAIFU_UI_MAX_SESSIONS];
+    uint16_t      cnt = 0;
+    uint16_t      i, j;
 
+    /* 先收集所有活跃会话 */
     for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
-        ui_session_t *s = &sg_sessions[i];
-        lv_obj_t     *row;
-
-        if (!s->used) {
-            continue;
+        if (sg_sessions[i].used) {
+            order[cnt++] = &sg_sessions[i];
         }
+    }
+
+    /* 按会话 ID（Topic）稳定排序（插入排序）：会话 ID 一旦分配便不再变化，
+     * 据此排序可保证列表顺序固定，不会因会话增删或状态更新而反复跳动。 */
+    for (i = 1; i < cnt; i++) {
+        ui_session_t *key = order[i];
+        j = i;
+        while (j > 0 && strcmp(order[j - 1]->sid, key->sid) > 0) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = key;
+    }
+
+    for (i = 0; i < cnt; i++) {
+        ui_session_t *s = order[i];
+        lv_obj_t     *row;
 
         row = __make_card(sg_root);
         lv_obj_set_width(row, LV_PCT(100));
@@ -561,17 +566,20 @@ static void __build_list(void)
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(row, 10, 0);
 
-        /* 状态（定宽，随状态变色） */
-        s->status_label = lv_label_create(row);
-        lv_obj_set_width(s->status_label, 72);
-
-        /* 任务（占据剩余空间，超长省略） */
+        /* 任务主题（主体，占据剩余空间，超长省略） */
         s->task_label = lv_label_create(row);
         lv_obj_set_flex_grow(s->task_label, 1);
         lv_label_set_long_mode(s->task_label, LV_LABEL_LONG_DOT);
 
-        /* 已运行时长（右侧） */
+        /* 状态（右侧定宽，随状态变色，右对齐） */
+        s->status_label = lv_label_create(row);
+        lv_obj_set_width(s->status_label, 64);
+        lv_obj_set_style_text_align(s->status_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+        /* 已运行时长（最右侧定宽，右对齐） */
         s->timer_label = lv_label_create(row);
+        lv_obj_set_width(s->timer_label, 72);
+        lv_obj_set_style_text_align(s->timer_label, LV_TEXT_ALIGN_RIGHT, 0);
 
         __paint_session(s);
     }
@@ -595,9 +603,8 @@ static void __rebuild(void)
     __paint_mood(sg_tier, n);
 
     switch (sg_tier) {
-    case TIER_SLEEP:  __build_sleep();  break;
-    case TIER_SINGLE: __build_single(); break;
-    default:          __build_list();   break;
+    case TIER_SLEEP: __build_sleep(); break;
+    default:         __build_list();  break;
     }
 }
 
@@ -650,8 +657,17 @@ static void __ui_refresh_cb(lv_timer_t *timer)
 
 void openwaifu_ui_init(void)
 {
-    lv_obj_t *screen = lv_screen_active();
-    lv_obj_t *title;
+    lv_display_t *disp = lv_display_get_default();
+    lv_obj_t     *screen;
+    lv_obj_t     *title;
+
+    /* 将屏幕旋转为横屏（物理竖屏 320x480 -> 逻辑横屏 480x320），
+     * 由 LVGL 端软件旋转完成，无需改动板级配置。 */
+    if (disp != NULL) {
+        lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+    }
+
+    screen = lv_screen_active();
 
     /* 深色背景 + 统一文本样式（CJK 字体） */
     lv_obj_set_style_bg_color(screen, lv_color_hex(COL_BG), 0);
@@ -663,23 +679,23 @@ void openwaifu_ui_init(void)
     title = lv_label_create(screen);
     lv_label_set_text(title, "OpenWaifu");
     lv_obj_set_style_text_color(title, lv_color_hex(COL_TEXT_SUB), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 10);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 8);
 
     sg_conn_label = lv_label_create(screen);
     lv_label_set_text(sg_conn_label, "未连接");
     lv_obj_set_style_text_color(sg_conn_label, lv_color_hex(COL_IDLE), 0);
-    lv_obj_align(sg_conn_label, LV_ALIGN_TOP_RIGHT, -12, 10);
+    lv_obj_align(sg_conn_label, LV_ALIGN_TOP_RIGHT, -12, 8);
 
     /* 情绪标题 */
     sg_mood_label = lv_label_create(screen);
     lv_label_set_text(sg_mood_label, "睡觉中");
     lv_obj_set_style_text_color(sg_mood_label, lv_color_hex(COL_IDLE), 0);
-    lv_obj_align(sg_mood_label, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(sg_mood_label, LV_ALIGN_TOP_MID, 0, 34);
 
-    /* 会话视图容器（按档位重建） */
+    /* 会话视图容器（按档位重建，填满标题栏以下区域） */
     sg_root = lv_obj_create(screen);
-    lv_obj_set_size(sg_root, LV_PCT(100), 396);
-    lv_obj_align(sg_root, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_set_size(sg_root, LV_PCT(100), 252);
+    lv_obj_align(sg_root, LV_ALIGN_TOP_MID, 0, 62);
     lv_obj_set_style_bg_opa(sg_root, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(sg_root, 0, 0);
     lv_obj_set_style_pad_all(sg_root, 8, 0);
