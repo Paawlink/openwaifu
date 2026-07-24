@@ -4,7 +4,7 @@
  *
  * 负责按顺序初始化各子系统：
  *   1. 日志与板级硬件（board_register_hardware）
- *   2. LVGL 图形界面（openwaifu_ui，消息列表）
+ *   2. LVGL 图形界面（openwaifu_ui，任务清单）
  *   3. BLE 从机（openwaifu_ble，接收电脑端推送的 Agent 信息）
  *
  * 具体的 BLE 收发逻辑见 openwaifu_ble.c，界面逻辑见 openwaifu_ui.c。
@@ -44,7 +44,7 @@ void user_main(void)
     /* 板级硬件注册（屏幕、触摸等） */
     board_register_hardware();
 
-    /* 初始化 LVGL 并构建界面（消息列表），随后启动 LVGL 任务 */
+    /* 初始化 LVGL 并构建界面（任务清单），随后启动 LVGL 任务 */
     lv_vendor_init(DISPLAY_NAME);
     openwaifu_ui_init();
     lv_vendor_start(5, 1024 * 8);

@@ -12,6 +12,7 @@ get_filename_component(APP_NAME ${APP_PATH} NAME)
 # APP_SRC
 aux_source_directory(${APP_PATH}/src APP_SRC)
 aux_source_directory(${APP_PATH}/src/fonts APP_SRC)
+aux_source_directory(${APP_PATH}/src/assets APP_SRC)
 
 # APP_INC
 set(APP_INC ${APP_PATH}/include)
