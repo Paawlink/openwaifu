@@ -19,12 +19,22 @@ extern "C" {
 
 /**
  * 虚拟形象动画状态。
- * 为“不同状态播放不同帧序列”预留扩展位：新增状态时在此追加枚举，并在
- * openwaifu_avatar.c 的序列表中登记对应帧资源即可；未登记的状态会自动
- * 回退到 THINKING 序列，保证行为安全。
+ *
+ * 分为三类：
+ * - 工作状态（THINKING / CODING / CYCLING）：有任务时随机选用其一。
+ * - 空闲状态（MOYU / SLEEP）：无任务时随机选用其一。
+ * - 事件状态（ERROR / CELEBRATION / CONFUSED）：事件触发时临时展示约 5 秒，
+ *   随后自动回落到之前的工作/空闲状态。
  */
 typedef enum {
-    OPENWAIFU_AVATAR_THINKING = 0, /* 思考 / 加载中（当前唯一有独立美术资源的状态） */
+    OPENWAIFU_AVATAR_THINKING = 0, /* 思考 / 加载中 */
+    OPENWAIFU_AVATAR_CODING,       /* 编码中 */
+    OPENWAIFU_AVATAR_CYCLING,      /* 骑行（工作中的趣味形象） */
+    OPENWAIFU_AVATAR_ERROR,        /* 出错（事件） */
+    OPENWAIFU_AVATAR_CELEBRATION,  /* 庆祝（任务完成事件） */
+    OPENWAIFU_AVATAR_CONFUSED,     /* 困惑（用户取消事件） */
+    OPENWAIFU_AVATAR_MOYU,         /* 摸鱼（空闲） */
+    OPENWAIFU_AVATAR_SLEEP,        /* 睡觉（空闲） */
     OPENWAIFU_AVATAR_STATE_MAX,
 } openwaifu_avatar_state_t;
 
@@ -38,6 +48,9 @@ lv_obj_t *openwaifu_avatar_create(lv_obj_t *parent);
 
 /**
  * 切换虚拟形象当前播放的帧序列（按状态）。
+ *
+ * 切换时带有淡入淡出过渡效果：先将不透明度从 255 渐变到 0（约 200 ms），
+ * 替换帧序列后再从 0 渐变回 255（约 200 ms），使形象切换更加自然。
  * 若目标状态未登记独立序列，则回退到 THINKING 序列；与当前状态相同则不重启动画。
  * @param state 目标状态
  */

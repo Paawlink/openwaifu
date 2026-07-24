@@ -21,8 +21,9 @@
  *   S|<sid>|<st>|<elapsed>|<plugin>|<task>  新增或更新某会话
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
- *   G|<ev>|<detail>                    全局事件（本布局不展示，忽略）
+ *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/X=Confused/D=Done）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
+ * <ev> 为单字符事件码：E=出错 X=取消 D=完成（驱动桌宠事件形象）。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
  *
  * @copyright Copyright (c) 2021-2024 Tuya Inc. All Rights Reserved.
@@ -31,6 +32,7 @@
 #include "openwaifu_ui.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lvgl.h"
@@ -44,7 +46,7 @@
 /** 最多同时展示的会话数（超过后新会话将被丢弃，不入表）。 */
 #define OPENWAIFU_UI_MAX_SESSIONS 8
 /** 会话 ID / 插件名 / 任务文本的本地缓存长度。 */
-#define OPENWAIFU_UI_SID_LEN      24
+#define OPENWAIFU_UI_SID_LEN      36
 #define OPENWAIFU_UI_PLUGIN_LEN   16
 #define OPENWAIFU_UI_TASK_LEN     96
 /** 详情数据缓存长度。 */
@@ -140,12 +142,41 @@ static bool         sg_structure_dirty = true; /* 会话增删或状态档位变
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
 static lv_obj_t    *sg_detail_screen   = NULL; /* 详情页屏幕（NULL 表示未打开） */
+static lv_obj_t    *sg_detail_content  = NULL; /* 详情页可滚动内容区（NULL 表示需全量构建） */
 static char         sg_detail_sid[OPENWAIFU_UI_SID_LEN] = ""; /* 当前查看的会话 ID */
 static bool         sg_detail_dirty    = false;  /* 详情页内容需要刷新 */
+
+/* ── 虚拟形象状态机 ───────────────────────────────────── */
+
+/**
+ * 桌宠形象分为三层：
+ * 1. 基础状态：由当前会话列表决定——无活跃任务时为 IDLE（Moyu / Sleep 随机），
+ *    有活跃任务时为 WORKING（Thinking / Coding / Cycling 随机）。
+ * 2. 事件状态：错误 / 用户取消 / 任务完成等事件触发，临时展示对应形象约 5 秒，
+ *    然后自动回落到基础状态。
+ * 3. 随机重摇：基础状态下每隔约 15 秒随机重新选择一个形象，避免长期固定不变，
+ *    但不会切换太快以防止分散注意力。
+ */
+typedef enum {
+    AVATAR_BASE_IDLE,    /* 无活跃任务 */
+    AVATAR_BASE_WORKING, /* 有活跃任务 */
+} avatar_base_t;
+
+#define AVATAR_EVENT_MS   5000  /* 事件形象展示时长（毫秒） */
+#define AVATAR_REROLL_MS  15000 /* 基础形象重摇间隔（毫秒） */
+
+static avatar_base_t sg_avatar_base         = AVATAR_BASE_IDLE;
+static bool          sg_avatar_event_active  = false;       /* 正在展示事件形象 */
+static lv_timer_t   *sg_avatar_event_timer   = NULL;        /* 事件超时定时器 */
+static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定时器 */
 
 /***********************************************************
  ***********************工具函数****************************
  ***********************************************************/
+
+/* 前向声明：avatar 状态机函数在刷新回调小节定义，此处先声明以供会话增删逻辑调用。 */
+static void __avatar_trigger_event(openwaifu_avatar_state_t state);
+static void __avatar_update_base(void);
 
 /** 手写的有界字符串拷贝（避免引入额外依赖，保证以 '\0' 结尾）。 */
 static void __str_copy(char *dst, const char *src, uint32_t cap)
@@ -277,8 +308,6 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     ui_vis_t      new_vis;
     char          old_body[OPENWAIFU_UI_TASK_LEN];
 
-    s->elapsed = elapsed; /* 详情页展示运行时长 */
-
     if (s == NULL) {
         s = __alloc_session(sid);
         if (s == NULL) {
@@ -286,6 +315,8 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
         }
         is_new = true;
     }
+
+    s->elapsed = elapsed; /* 详情页展示运行时长 */
 
     /* 覆盖前先记下“当前已显示的主体文本”。不能用 lv_label_get_text 比对：
      * LONG_DOT 会把省略号就地写回标签缓冲区，取回的是带“…”的截断串，与完整
@@ -301,8 +332,15 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     __str_copy(s->plugin, (plugin != NULL && plugin[0] != '\0') ? plugin : "agent",
                sizeof(s->plugin));
     __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
-    s->status = st;
-    s->done   = (st == ST_IDLE);
+    /* 检测任务完成：已有会话从运行中变为空闲（IDLE）时触发庆祝动画 */
+    {
+        bool was_done = s->done;
+        s->status = st;
+        s->done   = (st == ST_IDLE);
+        if (!is_new && !was_done && s->done) {
+            __avatar_trigger_event(OPENWAIFU_AVATAR_CELEBRATION);
+        }
+    }
     s->seen   = true; /* 本轮快照中出现过，E 时不会被清除 */
 
     /* 每轮 S 命令重置详情数据，随后到达的 D 命令会全量重建 */
@@ -328,6 +366,11 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
         }
     }
     s->vis = new_vis;
+
+    /* S 命令更新了状态/时长/任务等基本信息，若详情页正在展示此会话则需刷新 */
+    if (sg_detail_screen != NULL && strcmp(sg_detail_sid, s->sid) == 0) {
+        sg_detail_dirty = true;
+    }
 }
 
 /***********************************************************
@@ -436,7 +479,18 @@ static void __ui_handle_line(char *line)
     }
 
     if (cmd == 'G' && line[1] == '|') {
-        /* 全局事件（泳道 2）：当前布局不展示，直接忽略。 */
+        /* 全局事件（泳道 2）：驱动虚拟形象事件状态。 */
+        char ev = line[2];
+        if (ev == 'E') {
+            /* 错误事件 -> Error 形象 */
+            __avatar_trigger_event(OPENWAIFU_AVATAR_ERROR);
+        } else if (ev == 'X') {
+            /* 用户取消事件 -> Confused 形象 */
+            __avatar_trigger_event(OPENWAIFU_AVATAR_CONFUSED);
+        } else if (ev == 'D') {
+            /* 任务完成事件 -> Celebration 形象 */
+            __avatar_trigger_event(OPENWAIFU_AVATAR_CELEBRATION);
+        }
         return;
     }
 
@@ -776,9 +830,10 @@ static void __detail_back_cb(lv_event_t *e)
     (void)e;
     if (sg_detail_screen != NULL) {
         lv_obj_delete(sg_detail_screen);
-        sg_detail_screen = NULL;
-        sg_detail_sid[0] = '\0';
-        sg_detail_dirty  = false;
+        sg_detail_screen  = NULL;
+        sg_detail_content = NULL;
+        sg_detail_sid[0]  = '\0';
+        sg_detail_dirty   = false;
         if (sg_main_screen != NULL) {
             lv_screen_load(sg_main_screen);
         }
@@ -795,7 +850,8 @@ static void __row_click_cb(lv_event_t *e)
     }
 
     __str_copy(sg_detail_sid, s->sid, sizeof(sg_detail_sid));
-    sg_detail_dirty = true;
+    sg_detail_dirty   = true;
+    sg_detail_content = NULL; /* 新详情页：需全量构建 */
 
     if (sg_detail_screen != NULL) {
         lv_obj_delete(sg_detail_screen);
@@ -849,10 +905,11 @@ static void __detail_add_section(lv_obj_t *parent, const char *title)
 static void __build_detail_view(void)
 {
     ui_session_t *s;
-    lv_obj_t     *screen, *header, *back, *title_lbl, *content;
+    lv_obj_t     *screen, *content;
     lv_obj_t     *card;
     char          buf[128];
     uint8_t       i;
+    int32_t       scroll_y = 0; /* 刷新时保存/恢复滚动位置 */
 
     if (sg_detail_screen == NULL) {
         return;
@@ -866,48 +923,60 @@ static void __build_detail_view(void)
     }
 
     screen = sg_detail_screen;
-    lv_obj_set_style_bg_color(screen, lv_color_hex(COL_BG), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(screen, lv_color_hex(COL_TITLE), 0);
-    lv_obj_set_style_text_font(screen, openwaifu_font(), 0);
-    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clean(screen);
 
-    /* 顶部标题栏（固定，不滚动） */
-    header = __make_card(screen);
-    lv_obj_set_width(header, LV_PCT(100));
-    lv_obj_set_height(header, 38);
-    lv_obj_set_style_pad_hor(header, 12, 0);
-    lv_obj_set_style_pad_ver(header, 4, 0);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(header, 12, 0);
-    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
+    if (sg_detail_content == NULL) {
+        /* 首次构建：设置屏幕样式 + 创建 header + 创建内容区 */
+        lv_obj_t *header, *back, *title_lbl;
 
-    back = lv_label_create(header);
-    lv_label_set_text(back, "\xE2\x86\x90 \xE8\xBF\x94\xE5\x9B\x9E"); /* ← 返回 */
-    lv_obj_set_style_text_color(back, lv_color_hex(COL_TITLE), 0);
-    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back, __detail_back_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_set_style_bg_color(screen, lv_color_hex(COL_BG), 0);
+        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(screen, lv_color_hex(COL_TITLE), 0);
+        lv_obj_set_style_text_font(screen, openwaifu_font(), 0);
+        lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clean(screen);
 
-    title_lbl = lv_label_create(header);
-    lv_label_set_text(title_lbl, "\xE4\xBB\xBB\xE5\x8A\xA1\xE8\xAF\xA6\xE6\x83\x85"); /* 任务详情 */
-    lv_obj_set_style_text_color(title_lbl, lv_color_hex(COL_TITLE), 0);
+        /* 顶部标题栏（固定，不滚动） */
+        header = __make_card(screen);
+        lv_obj_set_width(header, LV_PCT(100));
+        lv_obj_set_height(header, 38);
+        lv_obj_set_style_pad_hor(header, 12, 0);
+        lv_obj_set_style_pad_ver(header, 4, 0);
+        lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(header, 12, 0);
+        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    /* 可滚动内容区 */
-    content = lv_obj_create(screen);
-    lv_obj_set_width(content, LV_PCT(100));
-    lv_obj_set_height(content, LV_PCT(100) - 42);
-    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_set_style_pad_all(content, 10, 0);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(content, 4, 0);
-    lv_obj_align(content, LV_ALIGN_TOP_LEFT, 0, 40);
+        back = lv_label_create(header);
+        lv_label_set_text(back, "\xE2\x86\x90 \xE8\xBF\x94\xE5\x9B\x9E"); /* ← 返回 */
+        lv_obj_set_style_text_color(back, lv_color_hex(COL_TITLE), 0);
+        lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(back, __detail_back_cb, LV_EVENT_CLICKED, NULL);
+
+        title_lbl = lv_label_create(header);
+        lv_label_set_text(title_lbl, "\xE4\xBB\xBB\xE5\x8A\xA1\xE8\xAF\xA6\xE6\x83\x85"); /* 任务详情 */
+        lv_obj_set_style_text_color(title_lbl, lv_color_hex(COL_TITLE), 0);
+
+        /* 可滚动内容区 */
+        content = lv_obj_create(screen);
+        lv_obj_set_width(content, LV_PCT(100));
+        lv_obj_set_height(content, LV_PCT(100) - 42);
+        lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(content, 0, 0);
+        lv_obj_set_style_pad_all(content, 10, 0);
+        lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_row(content, 4, 0);
+        lv_obj_align(content, LV_ALIGN_TOP_LEFT, 0, 40);
+        sg_detail_content = content;
+    } else {
+        /* 刷新：只清空内容区子对象，保留 header 和滚动位置 */
+        content = sg_detail_content;
+        scroll_y = lv_obj_get_scroll_y(content);
+        lv_obj_clean(content);
+    }
 
     /* —— 基本信息卡片 —— */
     card = __make_card(content);
@@ -1002,6 +1071,109 @@ static void __build_detail_view(void)
         lv_label_set_text(hint, "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xA6\xE6\x83\x85\xE6\x95\xB0\xE6\x8D\xAE");
         lv_obj_set_style_text_color(hint, lv_color_hex(COL_TEXT_SUB), 0);
     }
+
+    /* 恢复刷新前的滚动位置（避免内容重建后跳回顶部） */
+    if (scroll_y > 0) {
+        lv_obj_update_layout(content);
+        lv_obj_scroll_to_y(content, scroll_y, LV_ANIM_OFF);
+    }
+}
+
+/***********************************************************
+ *********************虚拟形象状态机************************
+ ***********************************************************/
+
+/** 随机选择一个空闲形象：Moyu 或 Sleep。 */
+static openwaifu_avatar_state_t __avatar_pick_idle(void)
+{
+    return (rand() % 2 == 0) ? OPENWAIFU_AVATAR_MOYU : OPENWAIFU_AVATAR_SLEEP;
+}
+
+/** 随机选择一个工作形象：Thinking、Coding 或 Cycling。 */
+static openwaifu_avatar_state_t __avatar_pick_working(void)
+{
+    switch (rand() % 3) {
+    case 0:  return OPENWAIFU_AVATAR_THINKING;
+    case 1:  return OPENWAIFU_AVATAR_CODING;
+    default: return OPENWAIFU_AVATAR_CYCLING;
+    }
+}
+
+/** 根据当前基础状态随机选择形象。 */
+static openwaifu_avatar_state_t __avatar_pick_base(void)
+{
+    return (sg_avatar_base == AVATAR_BASE_IDLE) ? __avatar_pick_idle()
+                                                 : __avatar_pick_working();
+}
+
+/** 事件超时回调：结束事件形象，回落到基础状态。 */
+static void __avatar_event_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    sg_avatar_event_active = false;
+    if (sg_avatar_event_timer != NULL) {
+        lv_timer_delete(sg_avatar_event_timer);
+        sg_avatar_event_timer = NULL;
+    }
+    /* 回落到基础状态形象 */
+    openwaifu_avatar_set_state(__avatar_pick_base());
+}
+
+/**
+ * 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。
+ * 如果上一个事件尚未结束，会重新计时并切换到新的事件形象。
+ */
+static void __avatar_trigger_event(openwaifu_avatar_state_t state)
+{
+    sg_avatar_event_active = true;
+    openwaifu_avatar_set_state(state);
+
+    /* （重新）启动事件超时定时器 */
+    if (sg_avatar_event_timer != NULL) {
+        lv_timer_delete(sg_avatar_event_timer);
+    }
+    sg_avatar_event_timer = lv_timer_create(__avatar_event_timer_cb,
+                                            AVATAR_EVENT_MS, NULL);
+    lv_timer_set_repeat_count(sg_avatar_event_timer, 1);
+}
+
+/** 随机重摇回调：每隔一段时间在当前基础状态的候选形象中重新选择一个。 */
+static void __avatar_reroll_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    /* 事件展示中不重摇，等事件结束后自然会回落 */
+    if (!sg_avatar_event_active) {
+        openwaifu_avatar_state_t pick = __avatar_pick_base();
+        openwaifu_avatar_set_state(pick);
+    }
+}
+
+/**
+ * 根据当前会话表重新计算基础状态（IDLE / WORKING）。
+ * 有任意活跃（非完成）会话则为 WORKING，否则为 IDLE。
+ * 基础状态变化时立即切换形象（事件展示中仅更新内部状态，不立即切换）。
+ */
+static void __avatar_update_base(void)
+{
+    uint16_t       i;
+    bool           has_active = false;
+    avatar_base_t  new_base;
+
+    for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
+        if (sg_sessions[i].used && !sg_sessions[i].done) {
+            has_active = true;
+            break;
+        }
+    }
+
+    new_base = has_active ? AVATAR_BASE_WORKING : AVATAR_BASE_IDLE;
+    if (new_base != sg_avatar_base) {
+        sg_avatar_base = new_base;
+        /* 基础状态变化时立即应用新形象（事件展示中则等结束后自动回落） */
+        if (!sg_avatar_event_active) {
+            openwaifu_avatar_set_state(__avatar_pick_base());
+        }
+    }
 }
 
 /***********************************************************
@@ -1043,6 +1215,9 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __build_detail_view();
         sg_detail_dirty = false;
     }
+
+    /* 更新虚拟形象基础状态（IDLE / WORKING） */
+    __avatar_update_base();
 }
 
 /***********************************************************
@@ -1112,5 +1287,15 @@ void openwaifu_ui_init(void)
     sg_structure_dirty = true;
     __rebuild_list();
     sg_structure_dirty = false;
+
+    /* 初始化虚拟形象状态机：随机种子 + 重摇定时器 + 初始形象 */
+    srand((unsigned int)lv_tick_get());
+    sg_avatar_base         = AVATAR_BASE_IDLE;
+    sg_avatar_event_active  = false;
+    sg_avatar_event_timer   = NULL;
+    sg_avatar_reroll_timer  = lv_timer_create(__avatar_reroll_cb,
+                                               AVATAR_REROLL_MS, NULL);
+    openwaifu_avatar_set_state(__avatar_pick_idle());
+
     lv_timer_create(__ui_refresh_cb, OPENWAIFU_UI_REFRESH_MS, NULL);
 }
