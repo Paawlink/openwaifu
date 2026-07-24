@@ -179,7 +179,6 @@ typedef enum {
 
 static avatar_base_t sg_avatar_base         = AVATAR_BASE_IDLE;
 static bool          sg_avatar_event_active  = false;       /* 正在展示事件形象 */
-static openwaifu_avatar_state_t sg_avatar_event_state = OPENWAIFU_AVATAR_CELEBRATION;
 static lv_timer_t   *sg_avatar_event_timer   = NULL;        /* 事件超时定时器 */
 static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定时器 */
 
@@ -355,14 +354,9 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     __str_copy(s->plugin, (plugin != NULL && plugin[0] != '\0') ? plugin : "agent",
                sizeof(s->plugin));
     __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
-    /* 检测任务完成：已有会话从运行中变为空闲（IDLE）时触发庆祝动画 */
     {
-        bool was_done = s->done;
         s->status = st;
         s->done   = (st == ST_IDLE);
-        if (!is_new && !was_done && s->done) {
-            __avatar_trigger_event(OPENWAIFU_AVATAR_CELEBRATION);
-        }
     }
     s->seen   = true; /* 本轮快照中出现过，E 时不会被清除 */
 
@@ -1223,19 +1217,10 @@ static void __avatar_event_timer_cb(lv_timer_t *timer)
     openwaifu_avatar_set_state(__avatar_pick_base());
 }
 
-/**
- * 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。
- * 取消事件优先于完成事件，其他事件仍按最后到达者切换并重新计时。
- */
+/** 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。 */
 static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 {
-    if (sg_avatar_event_active && sg_avatar_event_state == OPENWAIFU_AVATAR_CONFUSED &&
-        state == OPENWAIFU_AVATAR_CELEBRATION) {
-        return;
-    }
-
     sg_avatar_event_active = true;
-    sg_avatar_event_state  = state;
     openwaifu_avatar_set_state(state);
 
     /* （重新）启动事件超时定时器 */
@@ -1402,7 +1387,6 @@ void openwaifu_ui_init(void)
     srand((unsigned int)lv_tick_get());
     sg_avatar_base         = AVATAR_BASE_IDLE;
     sg_avatar_event_active  = false;
-    sg_avatar_event_state   = OPENWAIFU_AVATAR_CELEBRATION;
     sg_avatar_event_timer   = NULL;
     sg_avatar_reroll_timer  = lv_timer_create(__avatar_reroll_cb,
                                                AVATAR_REROLL_MS, NULL);
