@@ -121,7 +121,9 @@ typedef struct {
     ui_status_t status;
     bool        done;        /* 收到 idle/完成后置位 */
     ui_vis_t    vis;         /* 缓存的可视档位，用于判断是否需要重建行 */
+    lv_obj_t   *row;         /* 行容器（reconcile 时复用，避免重建导致 indicator 闪烁） */
     lv_obj_t   *title_label; /* 任务主题标签（可就地更新文本） */
+    lv_obj_t   *indicator;   /* 状态指示灯（vis 变化时原地替换） */
     uint32_t    elapsed;     /* 运行时长（秒），详情页展示 */
     /* 详情数据（D 命令同步） */
     ui_meta_entry_t meta[OPENWAIFU_UI_MAX_META];
@@ -137,7 +139,8 @@ static ui_session_t sg_sessions[OPENWAIFU_UI_MAX_SESSIONS];
 static lv_obj_t    *sg_list            = NULL; /* 右栏任务清单容器（按会话增删重建） */
 static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接状态刷新内容） */
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
-static bool         sg_structure_dirty = true; /* 会话增删或状态档位变化时需重建列表 */
+static bool         sg_structure_dirty = true; /* 会话增删时需协调列表 */
+static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
 
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
@@ -177,6 +180,8 @@ static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定�
 /* 前向声明：avatar 状态机函数在刷新回调小节定义，此处先声明以供会话增删逻辑调用。 */
 static void __avatar_trigger_event(openwaifu_avatar_state_t state);
 static void __avatar_update_base(void);
+/* 前向声明：指示灯构建函数在视图构建小节定义，此处先声明以供会话更新逻辑原地替换。 */
+static lv_obj_t *__make_indicator(lv_obj_t *parent, ui_vis_t vis);
 
 /** 手写的有界字符串拷贝（避免引入额外依赖，保证以 '\0' 结尾）。 */
 static void __str_copy(char *dst, const char *src, uint32_t cap)
@@ -265,6 +270,13 @@ static ui_session_t *__alloc_session(const char *sid)
 
     for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
         if (!sg_sessions[i].used) {
+            /* 重用槽位前清理可能残留的行对象（会话被移除后槽位被复用） */
+            if (sg_sessions[i].row != NULL) {
+                lv_obj_delete(sg_sessions[i].row);
+                sg_sessions[i].row       = NULL;
+                sg_sessions[i].title_label = NULL;
+                sg_sessions[i].indicator   = NULL;
+            }
             memset(&sg_sessions[i], 0, sizeof(sg_sessions[i]));
             sg_sessions[i].used = true;
             __str_copy(sg_sessions[i].sid, sid, sizeof(sg_sessions[i].sid));
@@ -293,9 +305,10 @@ static void __sync_end(void)
 
     for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
         if (sg_sessions[i].used && !sg_sessions[i].seen) {
-            sg_sessions[i].used        = false;
-            sg_sessions[i].title_label = NULL;
-            sg_structure_dirty         = true;
+            sg_sessions[i].used = false;
+            /* 不清除 row/title_label/indicator 指针：reconcile 需根据 row!=NULL
+             * 判断哪些行需要删除。删除后由 reconcile 统一置 NULL。 */
+            sg_structure_dirty  = true;
         }
     }
 }
@@ -350,19 +363,38 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 
     new_vis = __vis_from_status(s->status, s->done);
 
-    /* 新增会话或状态档位变化会改变行结构（增删行 / 切换指示灯类型），需重建列表；
-     * 仅任务文本变化时就地更新标签即可，避免无谓重建。 */
-    if (is_new || new_vis != s->vis) {
-        sg_structure_dirty = true;
-    } else if (s->title_label != NULL) {
-        const char *body = s->task[0] != '\0' ? s->task
-                                              : (s->plugin[0] != '\0' ? s->plugin : "—");
-        /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
-         * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
-         * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
-         * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
-        if (strcmp(old_body, body) != 0) {
-            lv_label_set_text(s->title_label, body);
+    /* 新增会话需协调列表以创建行；状态档位变化时若行已存在则原地替换指示灯，
+     * 避免全量重建导致其他会话的 spinner 动画中断闪烁。仅任务文本变化时就地更新标签。 */
+    {
+        bool need_rebuild = false;
+
+        if (is_new) {
+            need_rebuild = true;
+        } else if (new_vis != s->vis) {
+            if (s->row != NULL) {
+                /* 行已存在：原地替换指示灯，无需全量重建 */
+                if (s->indicator != NULL) {
+                    lv_obj_delete(s->indicator);
+                }
+                s->indicator = __make_indicator(s->row, new_vis);
+            } else {
+                /* 行尚未创建：需要全量重建 */
+                need_rebuild = true;
+            }
+        }
+
+        if (need_rebuild) {
+            sg_structure_dirty = true;
+        } else if (s->title_label != NULL) {
+            const char *body = s->task[0] != '\0' ? s->task
+                                                  : (s->plugin[0] != '\0' ? s->plugin : "—");
+            /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
+             * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
+             * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
+             * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
+            if (strcmp(old_body, body) != 0) {
+                lv_label_set_text(s->title_label, body);
+            }
         }
     }
     s->vis = new_vis;
@@ -716,16 +748,22 @@ static void __build_avatar(lv_obj_t *parent)
     openwaifu_avatar_create(avatar);
 }
 
-/** 按当前会话表重建右栏任务清单（清空并按稳定顺序重新生成行）。 */
+/** 按当前会话表协调右栏任务清单（增量删除/创建/排序行，保留已有行的 indicator 动画）。 */
 static void __rebuild_list(void)
 {
     ui_session_t *order[OPENWAIFU_UI_MAX_SESSIONS];
     uint16_t      cnt = 0;
     uint16_t      i, j;
 
-    lv_obj_clean(sg_list);
+    /* Step 1: 删除已不再活跃的会话行（used=false 但 row 仍存在）。
+     * 不清除 used=true 会话的行——它们的 indicator 动画需要保持连续。 */
     for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
-        sg_sessions[i].title_label = NULL;
+        if (!sg_sessions[i].used && sg_sessions[i].row != NULL) {
+            lv_obj_delete(sg_sessions[i].row);
+            sg_sessions[i].row         = NULL;
+            sg_sessions[i].title_label = NULL;
+            sg_sessions[i].indicator   = NULL;
+        }
     }
 
     /* 收集所有活跃会话 */
@@ -735,15 +773,21 @@ static void __rebuild_list(void)
         }
     }
 
-    /* 空状态：居中提示（依据连接状态给出有意义文案）。 */
+    /* 空状态：仅在首次进入时创建提示标签，避免每次刷新重建 */
     if (cnt == 0) {
-        lv_obj_t *hint = lv_label_create(sg_list);
-
-        lv_label_set_text(hint, "暂无任务");
-        lv_obj_set_style_text_color(hint, lv_color_hex(COL_TEXT_SUB), 0);
+        if (sg_empty_hint == NULL) {
+            sg_empty_hint = lv_label_create(sg_list);
+            lv_label_set_text(sg_empty_hint, "暂无任务");
+            lv_obj_set_style_text_color(sg_empty_hint, lv_color_hex(COL_TEXT_SUB), 0);
+        }
         lv_obj_set_flex_align(sg_list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                               LV_FLEX_ALIGN_CENTER);
         return;
+    }
+    /* 非空状态：清除空状态提示（若存在） */
+    if (sg_empty_hint != NULL) {
+        lv_obj_delete(sg_empty_hint);
+        sg_empty_hint = NULL;
     }
     lv_obj_set_flex_align(sg_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_START);
@@ -760,39 +804,53 @@ static void __rebuild_list(void)
         order[j] = key;
     }
 
+    /* 为每个会话创建新行或调整已有行顺序。
+     * 新行创建在 sg_list 末尾，随后通过 lv_obj_move_to_index 移到正确位置。
+     * 已有行直接移动到目标索引——LVGL 会自动调整其他子对象的位置。
+     * 这样已有行的 indicator（含 spinner 动画）不会被销毁重建，消除闪烁。 */
     for (i = 0; i < cnt; i++) {
         ui_session_t *s = order[i];
-        lv_obj_t     *row;
-        const char   *body;
 
-        row = __make_card(sg_list);
-        lv_obj_set_width(row, LV_PCT(100));
-        lv_obj_set_height(row, LV_SIZE_CONTENT);
-        lv_obj_set_style_pad_hor(row, 8, 0);
-        lv_obj_set_style_pad_ver(row, 5, 0);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(row, 8, 0);
+        if (s->row == NULL) {
+            /* 新会话：创建完整行 */
+            lv_obj_t *row = __make_card(sg_list);
+            const char *body;
 
-        /* 使行可点击：点击后打开该会话的详情页 */
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, __row_click_cb, LV_EVENT_CLICKED, s);
+            lv_obj_set_width(row, LV_PCT(100));
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_pad_hor(row, 8, 0);
+            lv_obj_set_style_pad_ver(row, 5, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 8, 0);
 
-        /* 插件图标（左，定宽彩色方块） */
-        __make_icon(row, s->plugin);
+            /* 使行可点击：点击后打开该会话的详情页 */
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, __row_click_cb, LV_EVENT_CLICKED, s);
 
-        /* 任务主题（主体，占据剩余空间，超长省略）。任务为空时回退到插件名，
-         * 避免主体长期只显示占位符。 */
-        body = s->task[0] != '\0' ? s->task : (s->plugin[0] != '\0' ? s->plugin : "—");
-        s->title_label = lv_label_create(row);
-        lv_obj_set_flex_grow(s->title_label, 1);
-        lv_label_set_long_mode(s->title_label, LV_LABEL_LONG_DOT);
-        lv_label_set_text(s->title_label, body);
-        lv_obj_set_style_text_color(s->title_label, lv_color_hex(COL_TITLE), 0);
+            /* 插件图标（左，定宽彩色方块） */
+            __make_icon(row, s->plugin);
 
-        /* 状态指示灯（右，spinner 或彩色圆点） */
-        __make_indicator(row, s->vis);
+            /* 任务主题（主体，占据剩余空间，超长省略）。任务为空时回退到插件名，
+             * 避免主体长期只显示占位符。 */
+            body = s->task[0] != '\0' ? s->task : (s->plugin[0] != '\0' ? s->plugin : "—");
+            s->title_label = lv_label_create(row);
+            lv_obj_set_flex_grow(s->title_label, 1);
+            lv_label_set_long_mode(s->title_label, LV_LABEL_LONG_DOT);
+            lv_label_set_text(s->title_label, body);
+            lv_obj_set_style_text_color(s->title_label, lv_color_hex(COL_TITLE), 0);
+
+            /* 状态指示灯（右，spinner 或彩色圆点） */
+            s->indicator = __make_indicator(row, s->vis);
+            s->row       = row;
+
+            /* 新行创建在末尾，移到正确位置 */
+            lv_obj_move_to_index(row, (int32_t)i);
+        } else {
+            /* 已有行：移到正确位置（会话增删后顺序可能变化） */
+            lv_obj_move_to_index(s->row, (int32_t)i);
+        }
     }
 }
 

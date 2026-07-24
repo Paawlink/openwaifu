@@ -2,7 +2,7 @@
  * @file openwaifu_avatar.c
  * @brief 左栏虚拟形象帧序列播放器实现（LVGL lv_animimg）。
  *
- * 帧资源由 src/assets/<emotion>_NN.c 提供（RGB565A8，135x185）。此处以
+ * 帧资源由 src/assets/<emotion>_NN.c 提供（内嵌 PNG，135x185）。此处以
  * "状态 -> 帧序列"的表驱动方式管理播放，并为每次状态切换添加淡入淡出
  * 过渡效果，使形象切换更加自然。
  *
@@ -14,38 +14,78 @@
 
 #include "openwaifu_avatar.h"
 
-/* ── 帧资源 extern 声明 ────────────────────────────────── */
+/* ── 帧资源声明 ────────────────────────────────────────── */
 
 /* Thinking（思考/加载）：8 帧 */
-extern const lv_image_dsc_t thinking_01, thinking_02, thinking_03, thinking_04;
-extern const lv_image_dsc_t thinking_05, thinking_06, thinking_07, thinking_08;
+LV_IMAGE_DECLARE(thinking_01);
+LV_IMAGE_DECLARE(thinking_02);
+LV_IMAGE_DECLARE(thinking_03);
+LV_IMAGE_DECLARE(thinking_04);
+LV_IMAGE_DECLARE(thinking_05);
+LV_IMAGE_DECLARE(thinking_06);
+LV_IMAGE_DECLARE(thinking_07);
+LV_IMAGE_DECLARE(thinking_08);
 
 /* Coding（编码）：8 帧 */
-extern const lv_image_dsc_t coding_01, coding_02, coding_03, coding_04;
-extern const lv_image_dsc_t coding_05, coding_06, coding_07, coding_08;
+LV_IMAGE_DECLARE(coding_01);
+LV_IMAGE_DECLARE(coding_02);
+LV_IMAGE_DECLARE(coding_03);
+LV_IMAGE_DECLARE(coding_04);
+LV_IMAGE_DECLARE(coding_05);
+LV_IMAGE_DECLARE(coding_06);
+LV_IMAGE_DECLARE(coding_07);
+LV_IMAGE_DECLARE(coding_08);
 
 /* Cycling（骑行）：6 帧 */
-extern const lv_image_dsc_t cycling_01, cycling_02, cycling_03;
-extern const lv_image_dsc_t cycling_04, cycling_05, cycling_06;
+LV_IMAGE_DECLARE(cycling_01);
+LV_IMAGE_DECLARE(cycling_02);
+LV_IMAGE_DECLARE(cycling_03);
+LV_IMAGE_DECLARE(cycling_04);
+LV_IMAGE_DECLARE(cycling_05);
+LV_IMAGE_DECLARE(cycling_06);
 
-/* Error（出错）：7 帧 */
-extern const lv_image_dsc_t error_01, error_02, error_03, error_04;
-extern const lv_image_dsc_t error_05, error_06, error_07;
+/* Error（出错）：7 帧（原始素材编号缺少 frame_04） */
+LV_IMAGE_DECLARE(error_01);
+LV_IMAGE_DECLARE(error_02);
+LV_IMAGE_DECLARE(error_03);
+LV_IMAGE_DECLARE(error_04);
+LV_IMAGE_DECLARE(error_05);
+LV_IMAGE_DECLARE(error_06);
+LV_IMAGE_DECLARE(error_07);
 
 /* Celebration（庆祝）：8 帧 */
-extern const lv_image_dsc_t celebration_01, celebration_02, celebration_03, celebration_04;
-extern const lv_image_dsc_t celebration_05, celebration_06, celebration_07, celebration_08;
+LV_IMAGE_DECLARE(celebration_01);
+LV_IMAGE_DECLARE(celebration_02);
+LV_IMAGE_DECLARE(celebration_03);
+LV_IMAGE_DECLARE(celebration_04);
+LV_IMAGE_DECLARE(celebration_05);
+LV_IMAGE_DECLARE(celebration_06);
+LV_IMAGE_DECLARE(celebration_07);
+LV_IMAGE_DECLARE(celebration_08);
 
 /* Confused（困惑）：8 帧 */
-extern const lv_image_dsc_t confused_01, confused_02, confused_03, confused_04;
-extern const lv_image_dsc_t confused_05, confused_06, confused_07, confused_08;
+LV_IMAGE_DECLARE(confused_01);
+LV_IMAGE_DECLARE(confused_02);
+LV_IMAGE_DECLARE(confused_03);
+LV_IMAGE_DECLARE(confused_04);
+LV_IMAGE_DECLARE(confused_05);
+LV_IMAGE_DECLARE(confused_06);
+LV_IMAGE_DECLARE(confused_07);
+LV_IMAGE_DECLARE(confused_08);
 
 /* Moyu（摸鱼）：6 帧 */
-extern const lv_image_dsc_t moyu_01, moyu_02, moyu_03;
-extern const lv_image_dsc_t moyu_04, moyu_05, moyu_06;
+LV_IMAGE_DECLARE(moyu_01);
+LV_IMAGE_DECLARE(moyu_02);
+LV_IMAGE_DECLARE(moyu_03);
+LV_IMAGE_DECLARE(moyu_04);
+LV_IMAGE_DECLARE(moyu_05);
+LV_IMAGE_DECLARE(moyu_06);
 
 /* Sleep（睡觉）：4 帧 */
-extern const lv_image_dsc_t sleep_01, sleep_02, sleep_03, sleep_04;
+LV_IMAGE_DECLARE(sleep_01);
+LV_IMAGE_DECLARE(sleep_02);
+LV_IMAGE_DECLARE(sleep_03);
+LV_IMAGE_DECLARE(sleep_04);
 
 /* ── 常量 ──────────────────────────────────────────────── */
 
