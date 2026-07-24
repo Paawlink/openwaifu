@@ -179,6 +179,7 @@ typedef enum {
 
 static avatar_base_t sg_avatar_base         = AVATAR_BASE_IDLE;
 static bool          sg_avatar_event_active  = false;       /* 正在展示事件形象 */
+static openwaifu_avatar_state_t sg_avatar_event_state;      /* 当前事件形象，用于事件优先级 */
 static lv_timer_t   *sg_avatar_event_timer   = NULL;        /* 事件超时定时器 */
 static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定时器 */
 
@@ -1220,7 +1221,15 @@ static void __avatar_event_timer_cb(lv_timer_t *timer)
 /** 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。 */
 static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 {
+    /* 失败/取消事件展示期间忽略迟到的完成事件，避免 Celebration 覆盖真实结果。 */
+    if (state == OPENWAIFU_AVATAR_CELEBRATION && sg_avatar_event_active &&
+        (sg_avatar_event_state == OPENWAIFU_AVATAR_ERROR ||
+         sg_avatar_event_state == OPENWAIFU_AVATAR_CONFUSED)) {
+        return;
+    }
+
     sg_avatar_event_active = true;
+    sg_avatar_event_state  = state;
     openwaifu_avatar_set_state(state);
 
     /* （重新）启动事件超时定时器 */
