@@ -30,6 +30,7 @@
 
 #include "openwaifu_ui.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "lvgl.h"
@@ -46,6 +47,13 @@
 #define OPENWAIFU_UI_SID_LEN      24
 #define OPENWAIFU_UI_PLUGIN_LEN   16
 #define OPENWAIFU_UI_TASK_LEN     96
+/** 详情数据缓存长度。 */
+#define OPENWAIFU_UI_ERR_LEN      96
+#define OPENWAIFU_UI_META_LEN     80
+#define OPENWAIFU_UI_CHAT_LEN     80
+#define OPENWAIFU_UI_CHAT_ROLE_LEN 16
+#define OPENWAIFU_UI_MAX_META     8
+#define OPENWAIFU_UI_MAX_CHAT    12
 /** UI 刷新定时器周期（毫秒）：用于拉取 BLE 命令并按需重建列表。 */
 #define OPENWAIFU_UI_REFRESH_MS   500
 
@@ -89,6 +97,17 @@ typedef enum {
     VIS_VIEWED,  /* 已查看：灰点 */
 } ui_vis_t;
 
+/** 元数据条目（"key: value" 文本）。 */
+typedef struct {
+    char text[OPENWAIFU_UI_META_LEN];
+} ui_meta_entry_t;
+
+/** 聊天消息（角色 + 内容摘要）。 */
+typedef struct {
+    char role[OPENWAIFU_UI_CHAT_ROLE_LEN];
+    char content[OPENWAIFU_UI_CHAT_LEN];
+} ui_chat_msg_t;
+
 /** 单个会话的本地状态与其绑定的 LVGL 标签。 */
 typedef struct {
     bool        used;
@@ -96,10 +115,17 @@ typedef struct {
     char        sid[OPENWAIFU_UI_SID_LEN];
     char        plugin[OPENWAIFU_UI_PLUGIN_LEN];
     char        task[OPENWAIFU_UI_TASK_LEN];
+    char        error_msg[OPENWAIFU_UI_ERR_LEN]; /* 错误信息（D 命令 kind=0） */
     ui_status_t status;
     bool        done;        /* 收到 idle/完成后置位 */
     ui_vis_t    vis;         /* 缓存的可视档位，用于判断是否需要重建行 */
     lv_obj_t   *title_label; /* 任务主题标签（可就地更新文本） */
+    uint32_t    elapsed;     /* 运行时长（秒），详情页展示 */
+    /* 详情数据（D 命令同步） */
+    ui_meta_entry_t meta[OPENWAIFU_UI_MAX_META];
+    uint8_t         meta_count;
+    ui_chat_msg_t   chat[OPENWAIFU_UI_MAX_CHAT];
+    uint8_t         chat_count;
 } ui_session_t;
 
 /***********************************************************
@@ -110,6 +136,12 @@ static lv_obj_t    *sg_list            = NULL; /* 右栏任务清单容器（按
 static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接状态刷新内容） */
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
 static bool         sg_structure_dirty = true; /* 会话增删或状态档位变化时需重建列表 */
+
+/* 详情页状态 */
+static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
+static lv_obj_t    *sg_detail_screen   = NULL; /* 详情页屏幕（NULL 表示未打开） */
+static char         sg_detail_sid[OPENWAIFU_UI_SID_LEN] = ""; /* 当前查看的会话 ID */
+static bool         sg_detail_dirty    = false;  /* 详情页内容需要刷新 */
 
 /***********************************************************
  ***********************工具函数****************************
@@ -243,8 +275,9 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     ui_session_t *s      = __find_session(sid);
     bool          is_new = false;
     ui_vis_t      new_vis;
+    char          old_body[OPENWAIFU_UI_TASK_LEN];
 
-    (void)elapsed; /* 当前布局不展示运行时长，仅保留协议兼容 */
+    s->elapsed = elapsed; /* 详情页展示运行时长 */
 
     if (s == NULL) {
         s = __alloc_session(sid);
@@ -254,12 +287,28 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
         is_new = true;
     }
 
+    /* 覆盖前先记下“当前已显示的主体文本”。不能用 lv_label_get_text 比对：
+     * LONG_DOT 会把省略号就地写回标签缓冲区，取回的是带“…”的截断串，与完整
+     * body 永远不等，导致每帧都误判为“已变化”而重设文本。 */
+    if (!is_new) {
+        const char *ob = s->task[0] != '\0' ? s->task
+                                            : (s->plugin[0] != '\0' ? s->plugin : "—");
+        __str_copy(old_body, ob, sizeof(old_body));
+    } else {
+        old_body[0] = '\0';
+    }
+
     __str_copy(s->plugin, (plugin != NULL && plugin[0] != '\0') ? plugin : "agent",
                sizeof(s->plugin));
     __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
     s->status = st;
     s->done   = (st == ST_IDLE);
     s->seen   = true; /* 本轮快照中出现过，E 时不会被清除 */
+
+    /* 每轮 S 命令重置详情数据，随后到达的 D 命令会全量重建 */
+    s->meta_count  = 0;
+    s->chat_count  = 0;
+    s->error_msg[0] = '\0';
 
     new_vis = __vis_from_status(s->status, s->done);
 
@@ -270,7 +319,13 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     } else if (s->title_label != NULL) {
         const char *body = s->task[0] != '\0' ? s->task
                                               : (s->plugin[0] != '\0' ? s->plugin : "—");
-        lv_label_set_text(s->title_label, body);
+        /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
+         * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
+         * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
+         * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
+        if (strcmp(old_body, body) != 0) {
+            lv_label_set_text(s->title_label, body);
+        }
     }
     s->vis = new_vis;
 }
@@ -278,6 +333,86 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 /***********************************************************
  ***********************命令行解析**************************
  ***********************************************************/
+
+/**
+ * @brief 处理会话详情命令（D|sid|kind|seq|text）。
+ *
+ * kind=0: 错误信息；kind=1: 元数据条目；kind=2: 聊天消息。
+ * seq 为 0-based 序号，固件端据此写入对应槽位。每个会话的详情数据在
+ * 快照同步开始（B）时不会清空——只有 S 命令会重建会话，D 命令随后
+ * 覆盖详情数据。详情数据的清空由 S 命令触发（新会话或重新 upsert 时
+ * 重置 meta_count/chat_count）。
+ */
+static void __handle_detail(char *line)
+{
+    /* D|sid|kind|seq|text —— 去掉 "D|" 后按 3 个分隔符切出 4 段 */
+    char *fields[4];
+    char *cur = line + 2;
+    int   nf  = 0;
+    uint32_t kind, seq;
+    ui_session_t *s;
+
+    for (; nf < 3; nf++) {
+        char *sep = strchr(cur, '|');
+        if (sep == NULL) {
+            break;
+        }
+        *sep = '\0';
+        fields[nf] = cur;
+        cur = sep + 1;
+    }
+    if (nf < 3) {
+        return;
+    }
+    fields[3] = cur; /* 剩余部分即 text */
+
+    s = __find_session(fields[0]);
+    if (s == NULL) {
+        return; /* 会话不存在，丢弃详情数据 */
+    }
+
+    kind = __atou(fields[1]);
+    seq  = __atou(fields[2]);
+
+    if (kind == 0) {
+        /* 错误信息 */
+        __str_copy(s->error_msg, fields[3], sizeof(s->error_msg));
+    } else if (kind == 1) {
+        /* 元数据条目 */
+        if (seq < OPENWAIFU_UI_MAX_META) {
+            __str_copy(s->meta[seq].text, fields[3], sizeof(s->meta[0].text));
+            if (seq + 1 > s->meta_count) {
+                s->meta_count = (uint8_t)(seq + 1);
+            }
+        }
+    } else if (kind == 2) {
+        /* 聊天消息：text 格式为 "role: content" */
+        if (seq < OPENWAIFU_UI_MAX_CHAT) {
+            char *colon = strchr(fields[3], ':');
+            if (colon != NULL) {
+                *colon = '\0';
+                __str_copy(s->chat[seq].role, fields[3], sizeof(s->chat[0].role));
+                /* 跳过 ": " */
+                char *content = colon + 1;
+                if (*content == ' ') {
+                    content++;
+                }
+                __str_copy(s->chat[seq].content, content, sizeof(s->chat[0].content));
+            } else {
+                __str_copy(s->chat[seq].role, "msg", sizeof(s->chat[0].role));
+                __str_copy(s->chat[seq].content, fields[3], sizeof(s->chat[0].content));
+            }
+            if (seq + 1 > s->chat_count) {
+                s->chat_count = (uint8_t)(seq + 1);
+            }
+        }
+    }
+
+    /* 如果正在查看此会话的详情页，标记需要刷新 */
+    if (sg_detail_screen != NULL && strcmp(sg_detail_sid, fields[0]) == 0) {
+        sg_detail_dirty = true;
+    }
+}
 
 /**
  * @brief 解析一条命令行并更新会话表（会就地修改 line 缓冲区）。
@@ -302,6 +437,11 @@ static void __ui_handle_line(char *line)
 
     if (cmd == 'G' && line[1] == '|') {
         /* 全局事件（泳道 2）：当前布局不展示，直接忽略。 */
+        return;
+    }
+
+    if (cmd == 'D' && line[1] == '|') {
+        __handle_detail(line);
         return;
     }
 
@@ -336,6 +476,11 @@ static void __ui_handle_line(char *line)
 /***********************************************************
  ***********************视图构建****************************
  ***********************************************************/
+
+/* 前向声明：行点击回调在详情页小节定义，此处先声明以供 __rebuild_list 使用。 */
+static void __row_click_cb(lv_event_t *e);
+/* 前向声明：详情页构建函数在行点击回调之后定义。 */
+static void __build_detail_view(void);
 
 /** 创建一张“像素风”卡片：白底 + 近黑圆角描边 + 轻投影，不可滚动。 */
 static lv_obj_t *__make_card(lv_obj_t *parent)
@@ -576,6 +721,10 @@ static void __rebuild_list(void)
                               LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(row, 8, 0);
 
+        /* 使行可点击：点击后打开该会话的详情页 */
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, __row_click_cb, LV_EVENT_CLICKED, s);
+
         /* 插件图标（左，定宽彩色方块） */
         __make_icon(row, s->plugin);
 
@@ -590,6 +739,268 @@ static void __rebuild_list(void)
 
         /* 状态指示灯（右，spinner 或彩色圆点） */
         __make_indicator(row, s->vis);
+    }
+}
+
+/***********************************************************
+ ***********************详情页******************************
+ ***********************************************************/
+
+/** 返回状态对应的中文标签。 */
+static const char *__status_label(ui_status_t s)
+{
+    switch (s) {
+    case ST_THINKING: return "思考中";
+    case ST_CODING:   return "编码中";
+    case ST_TESTING:  return "测试中";
+    case ST_ERROR:    return "出错";
+    case ST_IDLE:     return "已完成";
+    default:          return "未知";
+    }
+}
+
+/** 格式化运行时长（秒）为可读字符串。 */
+static void __format_elapsed(uint32_t seconds, char *out, uint32_t out_size)
+{
+    if (seconds < 60) {
+        snprintf(out, out_size, "%lus", (unsigned long)seconds);
+    } else {
+        snprintf(out, out_size, "%lum %lus", (unsigned long)(seconds / 60),
+                 (unsigned long)(seconds % 60));
+    }
+}
+
+/** 返回按钮点击回调：关闭详情页，返回主屏幕。 */
+static void __detail_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (sg_detail_screen != NULL) {
+        lv_obj_delete(sg_detail_screen);
+        sg_detail_screen = NULL;
+        sg_detail_sid[0] = '\0';
+        sg_detail_dirty  = false;
+        if (sg_main_screen != NULL) {
+            lv_screen_load(sg_main_screen);
+        }
+    }
+}
+
+/** 行点击回调：打开对应会话的详情页。 */
+static void __row_click_cb(lv_event_t *e)
+{
+    ui_session_t *s = (ui_session_t *)lv_event_get_user_data(e);
+
+    if (s == NULL || !s->used) {
+        return;
+    }
+
+    __str_copy(sg_detail_sid, s->sid, sizeof(sg_detail_sid));
+    sg_detail_dirty = true;
+
+    if (sg_detail_screen != NULL) {
+        lv_obj_delete(sg_detail_screen);
+    }
+    sg_detail_screen = lv_obj_create(NULL);
+    lv_screen_load(sg_detail_screen);
+    /* 立即构建详情内容，避免短暂空白 */
+    __build_detail_view();
+    sg_detail_dirty = false;
+}
+
+/** 在详情页内容区添加一行文本（带标签前缀）。 */
+static void __detail_add_label(lv_obj_t *parent, const char *prefix,
+                                const char *body, lv_color_t color)
+{
+    lv_obj_t *row = __make_plain(parent);
+    lv_obj_t *lbl;
+    char buf[OPENWAIFU_UI_TASK_LEN + 32];
+
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 4, 0);
+
+    if (prefix != NULL && prefix[0] != '\0') {
+        lbl = lv_label_create(row);
+        lv_label_set_text(lbl, prefix);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(COL_TEXT_SUB), 0);
+    }
+
+    lbl = lv_label_create(row);
+    snprintf(buf, sizeof(buf), "%s", body != NULL ? body : "");
+    lv_label_set_text(lbl, buf);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, LV_PCT(100));
+}
+
+/** 添加小节标题（如“元数据”“聊天上下文”）。 */
+static void __detail_add_section(lv_obj_t *parent, const char *title)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+
+    lv_label_set_text(lbl, title);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_TEXT_SUB), 0);
+    lv_obj_set_width(lbl, LV_PCT(100));
+    lv_obj_set_style_pad_top(lbl, 4, 0);
+}
+
+/** 构建详情页内容（在 sg_detail_screen 上填充）。 */
+static void __build_detail_view(void)
+{
+    ui_session_t *s;
+    lv_obj_t     *screen, *header, *back, *title_lbl, *content;
+    lv_obj_t     *card;
+    char          buf[128];
+    uint8_t       i;
+
+    if (sg_detail_screen == NULL) {
+        return;
+    }
+
+    s = __find_session(sg_detail_sid);
+    if (s == NULL || !s->used) {
+        /* 会话已不存在，自动返回 */
+        __detail_back_cb(NULL);
+        return;
+    }
+
+    screen = sg_detail_screen;
+    lv_obj_set_style_bg_color(screen, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(screen, lv_color_hex(COL_TITLE), 0);
+    lv_obj_set_style_text_font(screen, openwaifu_font(), 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clean(screen);
+
+    /* 顶部标题栏（固定，不滚动） */
+    header = __make_card(screen);
+    lv_obj_set_width(header, LV_PCT(100));
+    lv_obj_set_height(header, 38);
+    lv_obj_set_style_pad_hor(header, 12, 0);
+    lv_obj_set_style_pad_ver(header, 4, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    back = lv_label_create(header);
+    lv_label_set_text(back, "\xE2\x86\x90 \xE8\xBF\x94\xE5\x9B\x9E"); /* ← 返回 */
+    lv_obj_set_style_text_color(back, lv_color_hex(COL_TITLE), 0);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back, __detail_back_cb, LV_EVENT_CLICKED, NULL);
+
+    title_lbl = lv_label_create(header);
+    lv_label_set_text(title_lbl, "\xE4\xBB\xBB\xE5\x8A\xA1\xE8\xAF\xA6\xE6\x83\x85"); /* 任务详情 */
+    lv_obj_set_style_text_color(title_lbl, lv_color_hex(COL_TITLE), 0);
+
+    /* 可滚动内容区 */
+    content = lv_obj_create(screen);
+    lv_obj_set_width(content, LV_PCT(100));
+    lv_obj_set_height(content, LV_PCT(100) - 42);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 10, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(content, 4, 0);
+    lv_obj_align(content, LV_ALIGN_TOP_LEFT, 0, 40);
+
+    /* —— 基本信息卡片 —— */
+    card = __make_card(content);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(card, 10, 0);
+    lv_obj_set_style_pad_ver(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 3, 0);
+
+    /* 状态行：● 状态标签 · 插件 · 时长 */
+    {
+        lv_obj_t *stat_row = __make_plain(card);
+        lv_obj_t *ind, *stat_lbl;
+        lv_obj_set_width(stat_row, LV_PCT(100));
+        lv_obj_set_height(stat_row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(stat_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(stat_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(stat_row, 6, 0);
+
+        ind = __make_indicator(stat_row, s->vis);
+        (void)ind;
+
+        stat_lbl = lv_label_create(stat_row);
+        __format_elapsed(s->elapsed, buf, sizeof(buf));
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
+                 " \xC2\xB7 %s \xC2\xB7 %s",
+                 __status_label(s->status),
+                 s->plugin[0] != '\0' ? s->plugin : "agent");
+        lv_label_set_text(stat_lbl, buf);
+        lv_obj_set_style_text_color(stat_lbl, lv_color_hex(COL_TITLE), 0);
+    }
+
+    /* 任务 */
+    __detail_add_label(card, "\xE4\xBB\xBB\xE5\x8A\xA1:",
+                       s->task[0] != '\0' ? s->task : "\xE2\x80\x94",
+                       lv_color_hex(COL_TITLE));
+
+    /* Session ID */
+    __detail_add_label(card, "ID:", s->sid, lv_color_hex(COL_TEXT_SUB));
+
+    /* 运行时长 */
+    __format_elapsed(s->elapsed, buf, sizeof(buf));
+    __detail_add_label(card, "\xE6\x97\xB6\xE9\x95\xBF:", buf,
+                       lv_color_hex(COL_TEXT_SUB));
+
+    /* 错误信息（如果有） */
+    if (s->error_msg[0] != '\0') {
+        __detail_add_label(card, "\xE9\x94\x99\xE8\xAF\xAF:",
+                           s->error_msg, lv_color_hex(COL_ERROR));
+    }
+
+    /* —— 元数据 —— */
+    if (s->meta_count > 0) {
+        __detail_add_section(content,
+                             "\xE2\x80\x94\xE2\x80\x94 \xE5\x85\x83\xE6\x95\xB0\xE6\x8D\xAE \xE2\x80\x94\xE2\x80\x94");
+        card = __make_card(content);
+        lv_obj_set_width(card, LV_PCT(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_hor(card, 10, 0);
+        lv_obj_set_style_pad_ver(card, 6, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(card, 2, 0);
+        for (i = 0; i < s->meta_count; i++) {
+            __detail_add_label(card, NULL, s->meta[i].text,
+                               lv_color_hex(COL_TITLE));
+        }
+    }
+
+    /* —— 聊天上下文 —— */
+    if (s->chat_count > 0) {
+        __detail_add_section(content,
+                             "\xE2\x80\x94\xE2\x80\x94 \xE8\x81\x8A\xE5\xA4\xA9\xE4\xB8\x8A\xE4\xB8\x8B\xE6\x96\x87 \xE2\x80\x94\xE2\x80\x94");
+        card = __make_card(content);
+        lv_obj_set_width(card, LV_PCT(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_hor(card, 10, 0);
+        lv_obj_set_style_pad_ver(card, 6, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(card, 3, 0);
+        for (i = 0; i < s->chat_count; i++) {
+            snprintf(buf, sizeof(buf), "[%s] %s",
+                     s->chat[i].role, s->chat[i].content);
+            __detail_add_label(card, NULL, buf, lv_color_hex(COL_TITLE));
+        }
+    }
+
+    /* 空状态提示 */
+    if (s->meta_count == 0 && s->chat_count == 0 && s->error_msg[0] == '\0') {
+        lv_obj_t *hint = lv_label_create(content);
+        lv_label_set_text(hint, "\xE6\x9A\x82\xE6\x97\xA0\xE8\xAF\xA6\xE6\x83\x85\xE6\x95\xB0\xE6\x8D\xAE");
+        lv_obj_set_style_text_color(hint, lv_color_hex(COL_TEXT_SUB), 0);
     }
 }
 
@@ -626,6 +1037,12 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __rebuild_list();
         sg_structure_dirty = false;
     }
+
+    /* 详情页内容需要刷新时重建（BLE D 命令更新了详情数据） */
+    if (sg_detail_screen != NULL && sg_detail_dirty) {
+        __build_detail_view();
+        sg_detail_dirty = false;
+    }
 }
 
 /***********************************************************
@@ -646,6 +1063,7 @@ void openwaifu_ui_init(void)
     }
 
     screen = lv_screen_active();
+    sg_main_screen = screen; /* 保存主屏幕引用，详情页返回时切回 */
 
     /* 浅色背景 + 统一文本样式（CJK 字体） */
     lv_obj_set_style_bg_color(screen, lv_color_hex(COL_BG), 0);
