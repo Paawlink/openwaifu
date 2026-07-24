@@ -16,14 +16,19 @@
  * 行右侧。为避免会话增删导致顺序反复跳动，列表按会话 ID（Topic）稳定排序。
  * 时长在本地按秒实时跳动，无需依赖推送频率。
  *
- * 数据来源：BLE 模块按 FIFO 暂存来自守护进程的命令行，UI 定时器逐条取出解析：
- *   C                                  清空所有会话
- *   X|<sid>                            移除某会话（完成/中止/超时）
+ * 数据来源：BLE 模块按 FIFO 暂存来自守护进程的命令行，UI 定时器逐条取出解析。
+ * 同一条通道复用两条**泳道**，按命令前缀区分：
+ *
+ * 泳道 1 · 会话列表全量快照（屏幕主体看板）：
  *   S|<sid>|<st>|<elapsed>|<plugin>|<task>  新增或更新某会话
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
+ *
+ * 泳道 2 · 全局事件（独立于列表的即时通知，驱动左下角全局状态机）：
+ *   G|<ev>|<detail>                    全局事件（ev：E=出错 X=已取消）
+ * 收到后左下角状态机切到对应状态，数秒后自动回落中性态（为将来“桌宠表情”预留）。
  *
  * @copyright Copyright (c) 2021-2024 Tuya Inc. All Rights Reserved.
  */
@@ -47,6 +52,10 @@
 #define OPENWAIFU_UI_TASK_LEN     96
 /** UI 刷新定时器周期（毫秒）：既用于拉取命令，也用于计时器跳秒。 */
 #define OPENWAIFU_UI_REFRESH_MS   500
+/** 全局事件（泳道 2）详情本地缓存长度。 */
+#define OPENWAIFU_UI_GEVENT_DETAIL_LEN 48
+/** 全局事件展示后自动回落中性态的时长（毫秒）。 */
+#define OPENWAIFU_UI_GEVENT_REVERT_MS  6000
 
 /* 配色（深色主题，突出状态色） */
 #define COL_BG          0x0E1116
@@ -83,6 +92,13 @@ typedef enum {
     TIER_OVERLOAD, /* >6 个任务 */
 } ui_tier_t;
 
+/** 全局事件状态机（泳道 2，屏幕左下角，瞬时态后自动回落）。 */
+typedef enum {
+    GEV_NORMAL, /* 中性态（无事件） */
+    GEV_ERROR,  /* 出错 */
+    GEV_CANCEL, /* 已取消 */
+} ui_gevent_t;
+
 /** 单个会话的本地状态与其绑定的 LVGL 标签。 */
 typedef struct {
     bool        used;
@@ -108,6 +124,12 @@ static lv_obj_t    *sg_mood_label        = NULL; /* 情绪档位标题 */
 static lv_obj_t    *sg_root              = NULL; /* 会话视图容器（按档位重建） */
 static ui_tier_t    sg_tier              = TIER_SLEEP;
 static bool         sg_structure_dirty   = true; /* 会话增删或档位变化时需整体重建 */
+
+/* 全局事件状态机（泳道 2）：屏幕左下角标签 + 当前状态 + 进入时刻 + 详情。 */
+static lv_obj_t    *sg_event_label       = NULL;
+static ui_gevent_t  sg_gevent            = GEV_NORMAL;
+static uint32_t     sg_gevent_tick       = 0;
+static char         sg_gevent_detail[OPENWAIFU_UI_GEVENT_DETAIL_LEN];
 
 /***********************************************************
  ***********************工具函数****************************
@@ -281,32 +303,6 @@ static ui_session_t *__alloc_session(const char *sid)
     return NULL;
 }
 
-static void __clear_sessions(void)
-{
-    uint16_t i;
-
-    for (i = 0; i < OPENWAIFU_UI_MAX_SESSIONS; i++) {
-        sg_sessions[i].used         = false;
-        sg_sessions[i].status_label = NULL;
-        sg_sessions[i].task_label   = NULL;
-        sg_sessions[i].timer_label  = NULL;
-    }
-    sg_structure_dirty = true;
-}
-
-static void __remove_session(const char *sid)
-{
-    ui_session_t *s = __find_session(sid);
-
-    if (s != NULL) {
-        s->used         = false;
-        s->status_label = NULL;
-        s->task_label   = NULL;
-        s->timer_label  = NULL;
-        sg_structure_dirty = true;
-    }
-}
-
 /** 快照同步开始：把所有现有会话标记为“未见”，等待本轮 S 命令重新点亮。 */
 static void __sync_begin(void)
 {
@@ -368,6 +364,14 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
  ***********************命令行解析**************************
  ***********************************************************/
 
+/** 触发一次全局事件（泳道 2）：记录状态、详情与进入时刻，供左下角状态机展示。 */
+static void __trigger_gevent(ui_gevent_t ev, const char *detail)
+{
+    sg_gevent      = ev;
+    sg_gevent_tick = lv_tick_get();
+    __str_copy(sg_gevent_detail, detail != NULL ? detail : "", sizeof(sg_gevent_detail));
+}
+
 /**
  * @brief 解析一条命令行并更新会话表（会就地修改 line 缓冲区）。
  */
@@ -376,11 +380,6 @@ static void __ui_handle_line(char *line)
     char cmd = line[0];
 
     if (cmd == '\0') {
-        return;
-    }
-
-    if (cmd == 'C' && line[1] == '\0') {
-        __clear_sessions();
         return;
     }
 
@@ -394,8 +393,21 @@ static void __ui_handle_line(char *line)
         return;
     }
 
-    if (cmd == 'X' && line[1] == '|') {
-        __remove_session(line + 2);
+    if (cmd == 'G' && line[1] == '|') {
+        /* G|<ev>|<detail> —— ev 为单字符事件码，detail 可为空 */
+        char        ev = line[2];
+        const char *detail;
+
+        if (ev == '\0') {
+            return;
+        }
+        /* line[3] 应为第二个分隔符 '|'，其后（可能为空）即 detail */
+        detail = (line[3] == '|') ? (line + 4) : "";
+        if (ev == 'X') {
+            __trigger_gevent(GEV_CANCEL, detail);
+        } else {
+            __trigger_gevent(GEV_ERROR, detail);
+        }
         return;
     }
 
@@ -504,6 +516,30 @@ static void __paint_mood(ui_tier_t t, uint32_t n)
         lv_label_set_text_fmt(sg_mood_label, "%s · %u 个任务", name, (unsigned)n);
     }
     lv_obj_set_style_text_color(sg_mood_label, lv_color_hex(hex), 0);
+}
+
+/** 刷新左下角全局事件状态机标签（泳道 2）。 */
+static void __paint_gevent(void)
+{
+    const char *name;
+    uint32_t    hex;
+
+    if (sg_event_label == NULL) {
+        return;
+    }
+
+    switch (sg_gevent) {
+    case GEV_ERROR:  name = "⚠ 出错"; hex = COL_ERROR;   break;
+    case GEV_CANCEL: name = "✋ 已取消"; hex = COL_TESTING; break;
+    default:         name = "· 就绪"; hex = COL_IDLE;    break;
+    }
+
+    if (sg_gevent != GEV_NORMAL && sg_gevent_detail[0] != '\0') {
+        lv_label_set_text_fmt(sg_event_label, "%s · %s", name, sg_gevent_detail);
+    } else {
+        lv_label_set_text(sg_event_label, name);
+    }
+    lv_obj_set_style_text_color(sg_event_label, lv_color_hex(hex), 0);
 }
 
 /** 睡觉视图：居中大号 Zzz + 提示。 */
@@ -638,6 +674,14 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         lv_obj_set_style_text_color(sg_conn_label, lv_color_hex(COL_IDLE), 0);
     }
 
+    /* 全局事件（泳道 2）：超过回落时长后自动回中性态，随后每帧刷新左下角标签。 */
+    if (sg_gevent != GEV_NORMAL &&
+        lv_tick_elaps(sg_gevent_tick) >= OPENWAIFU_UI_GEVENT_REVERT_MS) {
+        sg_gevent            = GEV_NORMAL;
+        sg_gevent_detail[0]  = '\0';
+    }
+    __paint_gevent();
+
     if (sg_structure_dirty) {
         __rebuild();
         sg_structure_dirty = false;
@@ -692,9 +736,10 @@ void openwaifu_ui_init(void)
     lv_obj_set_style_text_color(sg_mood_label, lv_color_hex(COL_IDLE), 0);
     lv_obj_align(sg_mood_label, LV_ALIGN_TOP_MID, 0, 34);
 
-    /* 会话视图容器（按档位重建，填满标题栏以下区域） */
+    /* 会话视图容器（按档位重建，填满标题栏以下区域）。
+     * 高度略缩短（与早期 252 相比），为底部全局状态条让出空间，避免与列表重叠。 */
     sg_root = lv_obj_create(screen);
-    lv_obj_set_size(sg_root, LV_PCT(100), 252);
+    lv_obj_set_size(sg_root, LV_PCT(100), 224);
     lv_obj_align(sg_root, LV_ALIGN_TOP_MID, 0, 62);
     lv_obj_set_style_bg_opa(sg_root, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(sg_root, 0, 0);
@@ -702,6 +747,11 @@ void openwaifu_ui_init(void)
     lv_obj_set_style_pad_row(sg_root, 8, 0);
     lv_obj_set_flex_flow(sg_root, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(sg_root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* 左下角全局事件状态机标签（泳道 2，默认中性态）。 */
+    sg_event_label = lv_label_create(screen);
+    lv_obj_align(sg_event_label, LV_ALIGN_BOTTOM_LEFT, 12, -8);
+    __paint_gevent();
 
     /* 首帧构建睡觉视图并启动周期刷新 */
     sg_structure_dirty = true;
