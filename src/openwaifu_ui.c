@@ -41,7 +41,14 @@
 #include "openwaifu_avatar.h"
 #include "openwaifu_ble.h"
 #include "openwaifu_font.h"
+#include "openwaifu_wakeup.h"
 #include "openwaifu_wifi.h"
+
+/* 右栏会话列表的插件图标资源（27x27 内嵌 PNG，见 src/assets/icon_*.c）。 */
+LV_IMAGE_DECLARE(icon_claude);   /* claudecode */
+LV_IMAGE_DECLARE(icon_openai);   /* codex */
+LV_IMAGE_DECLARE(icon_opencode); /* opencode */
+LV_IMAGE_DECLARE(icon_qoder);    /* qoder */
 
 /***********************************************************
  *************************宏定义****************************
@@ -146,6 +153,8 @@ static bool         sg_structure_dirty = true; /* 会话增删时需协调列表
 static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
 static lv_obj_t    *sg_wifi_icon       = NULL; /* 左栏人物框右上角的 WiFi 已连接图标 */
 static bool         sg_wifi_last       = false; /* 上次已展示的 WiFi 连接状态 */
+static lv_obj_t    *sg_mic_icon        = NULL; /* WiFi 左侧的本地关键词监听图标 */
+static bool         sg_mic_last        = false; /* 上次已展示的关键词监听状态 */
 
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
@@ -248,7 +257,7 @@ static ui_vis_t __vis_from_status(ui_status_t s, bool done)
     return VIS_RUNNING;
 }
 
-/** 按插件类型返回图标底色。 */
+/** 按插件类型返回图标底色（仅用于无对应软件图标时的回退方块）。 */
 static lv_color_t __plugin_color(const char *plugin)
 {
     if (strcmp(plugin, "claudecode") == 0) {
@@ -261,6 +270,24 @@ static lv_color_t __plugin_color(const char *plugin)
         return lv_color_hex(COL_ICON_OPEN);
     }
     return lv_color_hex(COL_ICON_AGENT);
+}
+
+/** 按插件类型返回对应真实软件图标；未知类型返回 NULL（回退到彩色方块）。 */
+static const lv_image_dsc_t *__plugin_icon_src(const char *plugin)
+{
+    if (strcmp(plugin, "claudecode") == 0) {
+        return &icon_claude;
+    }
+    if (strcmp(plugin, "codex") == 0) {
+        return &icon_openai;
+    }
+    if (strcmp(plugin, "opencode") == 0) {
+        return &icon_opencode;
+    }
+    if (strcmp(plugin, "qoder") == 0) {
+        return &icon_qoder;
+    }
+    return NULL;
 }
 
 /***********************************************************
@@ -683,9 +710,21 @@ static lv_obj_t *__make_indicator(lv_obj_t *parent, ui_vis_t vis)
     }
 }
 
-/** 创建插件图标（彩色圆角方块 + 近黑描边），色彩由 plugin_type 决定。 */
+/** 创建插件图标：已知插件用对应真实软件图标（27x27 PNG），
+ *  未知插件回退到彩色圆角方块 + 近黑描边（色彩由 plugin_type 决定）。 */
 static lv_obj_t *__make_icon(lv_obj_t *parent, const char *plugin)
 {
+    const lv_image_dsc_t *src = __plugin_icon_src(plugin);
+
+    if (src != NULL) {
+        lv_obj_t *img = lv_image_create(parent);
+
+        lv_image_set_src(img, src);
+        lv_obj_set_size(img, 27, 27);
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+        return img;
+    }
+
     lv_obj_t *icon = lv_obj_create(parent);
 
     lv_obj_set_size(icon, 26, 26);
@@ -764,6 +803,10 @@ static void __rebuild_legend(void)
 static void __build_avatar(lv_obj_t *parent)
 {
     lv_obj_t *avatar = __make_card(parent);
+    lv_obj_t *mic_body;
+    lv_obj_t *mic_yoke;
+    lv_obj_t *mic_stem;
+    lv_obj_t *mic_base;
 
     lv_obj_set_width(avatar, 188);
     lv_obj_set_height(avatar, LV_PCT(100));
@@ -778,6 +821,52 @@ static void __build_avatar(lv_obj_t *parent)
     lv_obj_set_style_text_color(sg_wifi_icon, lv_color_hex(COL_DONE), 0);
     lv_obj_align(sg_wifi_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
     lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
+
+    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。 */
+    sg_mic_icon = __make_plain(avatar);
+    lv_obj_set_size(sg_mic_icon, 16, 16);
+    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, -22, 0);
+    lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
+
+    mic_body = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_body, 6, 9);
+    lv_obj_align(mic_body, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(mic_body, 3, 0);
+    lv_obj_set_style_bg_opa(mic_body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(mic_body, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_border_width(mic_body, 2, 0);
+    lv_obj_set_style_pad_all(mic_body, 0, 0);
+    lv_obj_clear_flag(mic_body, LV_OBJ_FLAG_SCROLLABLE);
+
+    mic_yoke = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_yoke, 10, 7);
+    lv_obj_align(mic_yoke, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_radius(mic_yoke, 5, 0);
+    lv_obj_set_style_bg_opa(mic_yoke, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(mic_yoke, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_border_width(mic_yoke, 2, 0);
+    lv_obj_set_style_border_side(mic_yoke, LV_BORDER_SIDE_BOTTOM |
+                                           LV_BORDER_SIDE_LEFT |
+                                           LV_BORDER_SIDE_RIGHT, 0);
+    lv_obj_set_style_pad_all(mic_yoke, 0, 0);
+    lv_obj_clear_flag(mic_yoke, LV_OBJ_FLAG_SCROLLABLE);
+
+    mic_stem = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_stem, 2, 3);
+    lv_obj_align(mic_stem, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(mic_stem, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_bg_opa(mic_stem, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mic_stem, 0, 0);
+    lv_obj_set_style_pad_all(mic_stem, 0, 0);
+
+    mic_base = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_base, 8, 2);
+    lv_obj_align(mic_base, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(mic_base, 1, 0);
+    lv_obj_set_style_bg_color(mic_base, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_bg_opa(mic_base, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mic_base, 0, 0);
+    lv_obj_set_style_pad_all(mic_base, 0, 0);
 }
 
 /** 按当前会话表协调右栏任务清单（增量删除/创建/排序行，保留已有行的 indicator 动画）。 */
@@ -1352,6 +1441,20 @@ static void __ui_refresh_cb(lv_timer_t *timer)
                 lv_obj_clear_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
             } else {
                 lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+
+    /* 端侧关键词唤醒成功运行时，在 WiFi 左侧显示麦克风图标。 */
+    if (sg_mic_icon != NULL) {
+        bool mic_on = openwaifu_wakeup_is_enabled() ? true : false;
+
+        if (mic_on != sg_mic_last) {
+            sg_mic_last = mic_on;
+            if (mic_on) {
+                lv_obj_clear_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
             }
         }
     }
