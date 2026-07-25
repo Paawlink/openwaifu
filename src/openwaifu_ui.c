@@ -21,7 +21,7 @@
  *   S|<sid>|<st>|<elapsed>|<plugin>|<task>  新增或更新某会话
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
- *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/X=Confused/D=Done）
+ *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/D=Done，X=取消仅记录不换形象）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
  * <ev> 为单字符事件码：E=出错 X=取消 D=完成（驱动桌宠事件形象）。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
@@ -153,8 +153,6 @@ static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
 static bool         sg_structure_dirty = true; /* 会话增删时需协调列表 */
 static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
-static lv_obj_t    *sg_mic_icon        = NULL; /* 左栏人物框右上角的本地关键词监听图标 */
-static bool         sg_mic_last        = false; /* 上次已展示的关键词监听状态 */
 
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
@@ -175,12 +173,15 @@ static uint32_t     sg_detail_displayed_elapsed = (uint32_t)-1;
 /* ── 虚拟形象状态机 ───────────────────────────────────── */
 
 /**
- * 桌宠形象分为三层：
- * 1. 基础状态：由当前会话列表决定——无活跃任务时为 IDLE（Moyu / Sleep 随机），
- *    有活跃任务时为 WORKING（Thinking / Coding / Cycling 随机）。
- * 2. 事件状态：错误 / 用户取消 / 任务完成等事件触发，临时展示对应形象约 5 秒，
+ * 桌宠形象分为四层（优先级由高到低）：
+ * 1. 语音交互层：按键触发录音时展示 Confused，录音结束后进入等待阶段展示
+ *    Thinking，直到 TTS 内容返回（或等待超时）才回落到下层状态。
+ *    Thinking / Confused 专用于语音交互，不再参与工作随机池与取消事件。
+ * 2. 事件状态：错误 / 任务完成等事件触发，临时展示对应形象约 5 秒，
  *    然后自动回落到基础状态。
- * 3. 随机重摇：基础状态下每隔约 15 秒随机重新选择一个形象，避免长期固定不变，
+ * 3. 基础状态：由当前会话列表决定——无活跃任务时为 IDLE（Moyu / Sleep 随机），
+ *    有活跃任务时为 WORKING（Coding / Cycling 随机，不含 Thinking）。
+ * 4. 随机重摇：基础状态下每隔约 15 秒随机重新选择一个形象，避免长期固定不变，
  *    但不会切换太快以防止分散注意力。
  */
 typedef enum {
@@ -196,6 +197,7 @@ static bool          sg_avatar_event_active  = false;       /* 正在展示事�
 static openwaifu_avatar_state_t sg_avatar_event_state;      /* 当前事件形象，用于事件优先级 */
 static lv_timer_t   *sg_avatar_event_timer   = NULL;        /* 事件超时定时器 */
 static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定时器 */
+static openwaifu_voice_phase_t sg_avatar_voice_phase = OPENWAIFU_VOICE_IDLE; /* 已应用的语音阶段 */
 
 /***********************************************************
  ***********************工具函数****************************
@@ -574,13 +576,11 @@ static void __ui_handle_line(char *line)
         if (ev == 'E') {
             /* 错误事件 -> Error 形象 */
             __avatar_trigger_event(OPENWAIFU_AVATAR_ERROR);
-        } else if (ev == 'X') {
-            /* 用户取消事件 -> Confused 形象 */
-            __avatar_trigger_event(OPENWAIFU_AVATAR_CONFUSED);
         } else if (ev == 'D') {
             /* 任务完成事件 -> Celebration 形象 */
             __avatar_trigger_event(OPENWAIFU_AVATAR_CELEBRATION);
         }
+        /* X（用户取消）不再切换形象：Confused 专用于语音录音阶段。 */
         return;
     }
 
@@ -805,62 +805,11 @@ static void __rebuild_legend(void)
 static void __build_avatar(lv_obj_t *parent)
 {
     lv_obj_t *avatar = __make_card(parent);
-    lv_obj_t *mic_body;
-    lv_obj_t *mic_yoke;
-    lv_obj_t *mic_stem;
-    lv_obj_t *mic_base;
 
     lv_obj_set_width(avatar, 188);
     lv_obj_set_height(avatar, LV_PCT(100));
     /* 虚拟形象动画：由 openwaifu_avatar 模块管理帧序列，后续可按状态切换序列。 */
     openwaifu_avatar_create(avatar);
-
-    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。
-     * 后于形象动画创建，保证图标始终浮在动画上层。 */
-    sg_mic_icon = __make_plain(avatar);
-    lv_obj_set_size(sg_mic_icon, 16, 16);
-    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-
-    mic_body = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_body, 6, 9);
-    lv_obj_align(mic_body, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_radius(mic_body, 3, 0);
-    lv_obj_set_style_bg_opa(mic_body, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(mic_body, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_border_width(mic_body, 2, 0);
-    lv_obj_set_style_pad_all(mic_body, 0, 0);
-    lv_obj_clear_flag(mic_body, LV_OBJ_FLAG_SCROLLABLE);
-
-    mic_yoke = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_yoke, 10, 7);
-    lv_obj_align(mic_yoke, LV_ALIGN_TOP_MID, 0, 4);
-    lv_obj_set_style_radius(mic_yoke, 5, 0);
-    lv_obj_set_style_bg_opa(mic_yoke, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(mic_yoke, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_border_width(mic_yoke, 2, 0);
-    lv_obj_set_style_border_side(mic_yoke, LV_BORDER_SIDE_BOTTOM |
-                                           LV_BORDER_SIDE_LEFT |
-                                           LV_BORDER_SIDE_RIGHT, 0);
-    lv_obj_set_style_pad_all(mic_yoke, 0, 0);
-    lv_obj_clear_flag(mic_yoke, LV_OBJ_FLAG_SCROLLABLE);
-
-    mic_stem = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_stem, 2, 3);
-    lv_obj_align(mic_stem, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_set_style_bg_color(mic_stem, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_bg_opa(mic_stem, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(mic_stem, 0, 0);
-    lv_obj_set_style_pad_all(mic_stem, 0, 0);
-
-    mic_base = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_base, 8, 2);
-    lv_obj_align(mic_base, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_radius(mic_base, 1, 0);
-    lv_obj_set_style_bg_color(mic_base, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_bg_opa(mic_base, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(mic_base, 0, 0);
-    lv_obj_set_style_pad_all(mic_base, 0, 0);
 }
 
 /** 按当前会话表协调右栏任务清单（增量删除/创建/排序行，保留已有行的 indicator 动画）。 */
@@ -1305,14 +1254,10 @@ static openwaifu_avatar_state_t __avatar_pick_idle(void)
     return (rand() % 2 == 0) ? OPENWAIFU_AVATAR_MOYU : OPENWAIFU_AVATAR_SLEEP;
 }
 
-/** 随机选择一个工作形象：Thinking、Coding 或 Cycling。 */
+/** 随机选择一个工作形象：Coding 或 Cycling（Thinking 专用于语音等待阶段）。 */
 static openwaifu_avatar_state_t __avatar_pick_working(void)
 {
-    switch (rand() % 3) {
-    case 0:  return OPENWAIFU_AVATAR_THINKING;
-    case 1:  return OPENWAIFU_AVATAR_CODING;
-    default: return OPENWAIFU_AVATAR_CYCLING;
-    }
+    return (rand() % 2 == 0) ? OPENWAIFU_AVATAR_CODING : OPENWAIFU_AVATAR_CYCLING;
 }
 
 /** 根据当前基础状态随机选择形象。 */
@@ -1331,17 +1276,23 @@ static void __avatar_event_timer_cb(lv_timer_t *timer)
         lv_timer_delete(sg_avatar_event_timer);
         sg_avatar_event_timer = NULL;
     }
-    /* 回落到基础状态形象 */
-    openwaifu_avatar_set_state(__avatar_pick_base());
+    /* 语音交互展示中不回落，等语音阶段结束后统一恢复 */
+    if (sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
+        openwaifu_avatar_set_state(__avatar_pick_base());
+    }
 }
 
-/** 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。 */
+/** 触发一个事件形象（Error / Celebration），展示约 5 秒后自动回落。 */
 static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 {
-    /* 失败/取消事件展示期间忽略迟到的完成事件，避免 Celebration 覆盖真实结果。 */
+    /* 语音交互展示中优先级更高，丢弃期间到达的事件形象。 */
+    if (sg_avatar_voice_phase != OPENWAIFU_VOICE_IDLE) {
+        return;
+    }
+
+    /* 失败事件展示期间忽略迟到的完成事件，避免 Celebration 覆盖真实结果。 */
     if (state == OPENWAIFU_AVATAR_CELEBRATION && sg_avatar_event_active &&
-        (sg_avatar_event_state == OPENWAIFU_AVATAR_ERROR ||
-         sg_avatar_event_state == OPENWAIFU_AVATAR_CONFUSED)) {
+        sg_avatar_event_state == OPENWAIFU_AVATAR_ERROR) {
         return;
     }
 
@@ -1362,10 +1313,39 @@ static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 static void __avatar_reroll_cb(lv_timer_t *timer)
 {
     (void)timer;
-    /* 事件展示中不重摇，等事件结束后自然会回落 */
-    if (!sg_avatar_event_active) {
+    /* 语音交互 / 事件展示中不重摇，结束后自然会回落 */
+    if (!sg_avatar_event_active && sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
         openwaifu_avatar_state_t pick = __avatar_pick_base();
         openwaifu_avatar_set_state(pick);
+    }
+}
+
+/**
+ * 轮询语音交互阶段并驱动对应形象（优先级最高）：
+ * 录音中 -> Confused；等待 TTS 回复 -> Thinking；
+ * 回到 IDLE（TTS 返回或超时）时恢复事件形象或基础形象。
+ */
+static void __avatar_poll_voice(void)
+{
+    openwaifu_voice_phase_t phase = openwaifu_wakeup_voice_phase();
+
+    if (phase == sg_avatar_voice_phase) {
+        return;
+    }
+    sg_avatar_voice_phase = phase;
+
+    switch (phase) {
+    case OPENWAIFU_VOICE_CAPTURING:
+        openwaifu_avatar_set_state(OPENWAIFU_AVATAR_CONFUSED);
+        break;
+    case OPENWAIFU_VOICE_WAITING:
+        openwaifu_avatar_set_state(OPENWAIFU_AVATAR_THINKING);
+        break;
+    default:
+        /* 语音交互结束：若事件形象仍在展示期内则恢复事件形象，否则回落基础形象 */
+        openwaifu_avatar_set_state(sg_avatar_event_active ? sg_avatar_event_state
+                                                          : __avatar_pick_base());
+        break;
     }
 }
 
@@ -1390,8 +1370,8 @@ static void __avatar_update_base(void)
     new_base = has_active ? AVATAR_BASE_WORKING : AVATAR_BASE_IDLE;
     if (new_base != sg_avatar_base) {
         sg_avatar_base = new_base;
-        /* 基础状态变化时立即应用新形象（事件展示中则等结束后自动回落） */
-        if (!sg_avatar_event_active) {
+        /* 基础状态变化时立即应用新形象（语音/事件展示中则等结束后自动回落） */
+        if (!sg_avatar_event_active && sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
             openwaifu_avatar_set_state(__avatar_pick_base());
         }
     }
@@ -1426,20 +1406,6 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __rebuild_legend();
     }
 
-    /* 端侧关键词唤醒成功运行时，在人物框右上角显示麦克风图标。 */
-    if (sg_mic_icon != NULL) {
-        bool mic_on = openwaifu_wakeup_is_enabled() ? true : false;
-
-        if (mic_on != sg_mic_last) {
-            sg_mic_last = mic_on;
-            if (mic_on) {
-                lv_obj_clear_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-    }
-
     if (sg_structure_dirty) {
         __rebuild_list();
         sg_structure_dirty = false;
@@ -1453,6 +1419,9 @@ static void __ui_refresh_cb(lv_timer_t *timer)
 
     /* 更新虚拟形象基础状态（IDLE / WORKING） */
     __avatar_update_base();
+
+    /* 轮询语音交互阶段（录音 Confused / 等待回复 Thinking） */
+    __avatar_poll_voice();
 }
 
 /***********************************************************
@@ -1502,8 +1471,12 @@ void openwaifu_ui_init(void)
                           LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(right, 8, 0);
 
-    /* 任务清单容器：占据右栏剩余空间，超出时可纵向滚动。 */
+    /* 任务清单容器：占据右栏剩余空间，超出时可纵向滚动。
+     * __make_plain 默认清除了 SCROLLABLE 标志，这里需重新开启。 */
     sg_list = __make_plain(right);
+    lv_obj_add_flag(sg_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(sg_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(sg_list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_width(sg_list, LV_PCT(100));
     lv_obj_set_flex_grow(sg_list, 1);
     lv_obj_set_flex_flow(sg_list, LV_FLEX_FLOW_COLUMN);

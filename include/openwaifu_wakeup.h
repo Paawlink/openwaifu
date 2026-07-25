@@ -1,6 +1,6 @@
 /**
  * @file openwaifu_wakeup.h
- * @brief OpenWaifu local wake-word detection.
+ * @brief OpenWaifu button-triggered audio capture.
  */
 
 #ifndef __OPENWAIFU_WAKEUP_H__
@@ -13,17 +13,26 @@ extern "C" {
 #endif
 
 /**
- * @brief Start local detection of the "Ni Hao Tuya" wake word.
- *
- * This only runs the on-device VAD/KWS pipeline. It does not start an AI
- * conversation or connect to Tuya Cloud.
+ * 语音交互阶段（供 UI 驱动虚拟形象）：
+ * - IDLE：无语音交互进行中。
+ * - CAPTURING：按键触发的录音进行中（UI 展示 Confused 形象）。
+ * - WAITING：录音已结束，等待守护进程返回 TTS 内容（UI 展示 Thinking 形象）。
+ */
+typedef enum {
+    OPENWAIFU_VOICE_IDLE = 0,
+    OPENWAIFU_VOICE_CAPTURING,
+    OPENWAIFU_VOICE_WAITING,
+} openwaifu_voice_phase_t;
+
+/**
+ * @brief Initialize button-triggered audio capture and TTS playback.
  */
 OPERATE_RET openwaifu_wakeup_init(void);
 
 /**
- * @brief Check whether local wake-word detection is running.
+ * @brief 查询当前语音交互阶段（等待超时后自动回落到 IDLE）。
  */
-BOOL_T openwaifu_wakeup_is_enabled(void);
+openwaifu_voice_phase_t openwaifu_wakeup_voice_phase(void);
 
 #ifdef __cplusplus
 }

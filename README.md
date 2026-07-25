@@ -14,7 +14,7 @@ OpenWaifu 是一个基于 TuyaOpen SDK 和 LVGL 9 的示例应用，运行在 T5
   - Write 特征 UUID：`00000001-0000-1001-8001-00805f9b07d0`
   - Notify 特征 UUID：`00000002-0000-1001-8001-00805f9b07d0`
 - 接收 UTF-8 命令行（支持中文），自动校验 UTF-8 合法性并按 FIFO 环形缓冲暂存
-- 本地“你好涂鸦”关键词唤醒，唤醒后通过 Notify 向 OpenWaifuD 发送 PCM 音频
+- 单击设备按键开始录音，通过 Notify 向 OpenWaifuD 发送 PCM 音频
 - LCD 会话看板：每个活跃会话固定占一行/一张卡片，实时显示状态、任务与本地跳秒的运行时长
 - 情绪状态机：按活跃会话数量切换（0=睡觉中、1=摸鱼中、2-3=认真搬砖、4-6=火力全开、>6=要炸了）
 - 左下角全局事件状态机（泳道 2）：收到完成/出错/取消事件时瞬时展示，数秒后自动回落中性态
@@ -33,29 +33,73 @@ OpenWaifu 是一个基于 TuyaOpen SDK 和 LVGL 9 的示例应用，运行在 T5
 UI 模块通过 BLE 模块暴露的接口（`openwaifu_ble_is_connected` / `openwaifu_ble_fetch_message`）
 单向拉取连接状态与新命令行，解析为会话看板的增/删/改，两个模块之间不直接依赖 LVGL 与 BLE 协议栈细节。
 
-## 固件构建
+## 部署（构建与烧录）
+
+### 环境要求
+
+- 已克隆 [TuyaOpen](https://github.com/tuya/TuyaOpen) 仓库（本应用位于 `apps/openwaifu`）
+- Python 3（`export.sh` 首次运行会自动创建 `.venv` 并安装 SDK 工具链，需要网络）
+- 硬件：T5AI 开发板（TUYA_T5AI_BOARD，3.5 寸 LCD）+ USB 串口线
+
+### 1. 初始化环境
 
 ```bash
-# 在仓库根目录初始化环境
+# 在 TuyaOpen 仓库根目录执行（每个新 shell 会话都需要 source 一次）
+cd TuyaOpen
 . ./export.sh
 
-# 注意选择正确的型号和lcd配置文件
-cd apps/openwaifu
-tos.py config choice
-tos.py config menu
+# 可选：检查工具链与子模块是否就绪
+tos.py check
+```
 
-# 构建 openwaifu（T5AI）
+### 2. 选择板型配置
+
+```bash
+cd apps/openwaifu
+
+# 交互式选择配置文件，选 config/TUYA_T5AI_BOARD_LCD_3.5.config
+tos.py config choice
+
+# 可选：需要微调配置项时再进菜单
+tos.py config menu
+```
+
+默认的 `app_default.config` 面向 TUYA_T5AI_BOARD；带 3.5 寸 LCD 的板子请务必选择 `TUYA_T5AI_BOARD_LCD_3.5.config`，否则屏幕无显示。
+
+### 3. 构建
+
+```bash
 tos.py build
 ```
 
-构建产物位于 `apps/openwaifu/dist/`。
+首次构建会拉取 T5AI 平台 SDK，耗时较长；构建产物位于 `apps/openwaifu/dist/`（含 QIO 全量固件与 OTA 包）。
 
-## 固件烧录
+### 4. 烧录
 
 ```bash
-
+# 接上 USB 串口线后烧录（不指定 -p 时会引导选择串口）
 tos.py flash
+
+# 指定串口与波特率（macOS 串口一般为 /dev/cu.usbserial-*）
+tos.py flash -p /dev/cu.usbserial-XXXX -b 921600
 ```
+
+烧录卡在等待设备时，按一下板上的复位（RST）键让设备进入下载模式。
+
+### 5. 验证
+
+```bash
+# 查看设备日志（退出：Ctrl-C）
+tos.py monitor -p /dev/cu.usbserial-XXXX
+```
+
+烧录成功后设备会：
+
+1. 屏幕显示会话看板，左栏为桌宠形象，底部图例显示「请连接蓝牙」；
+2. 以 `OpenWaifu` 名称开始 BLE 广播；
+3. 电脑端启动 OpenWaifuD 后自动被连接，图例切换为状态说明，即部署完成。
+
+后续部署顺序：先烧录本固件 → 再运行电脑端守护进程 OpenWaifuD → 最后接入 Agent 桥接（见各自仓库 README）。
 
 ## 配置说明
 
@@ -125,15 +169,12 @@ Notify 特征同时承载文本状态与二进制音频。二进制音频包均�
 | 结束 `3` | `OWA, type, stream_id:u32, pcm_bytes:u32, dropped_bytes:u32` | 结束录音并报告丢弃量 |
 
 当前音频格式由板级音频配置上报，T5AI 默认是 16 kHz、16-bit、单声道 PCM。
-唤醒后固定录制 5 秒，不使用设备端 VAD 判断用户语音结束。底层 VAD 仍仅用于
-关键词检测的数据喂入；录音中的静音由 OpenWaifuD 的 Whisper VAD 在识别时过滤。
-
-VAD 阈值固定为 -40 dB（官方嘈杂环境推荐档位）。
+单击设备按键后固定录制 5 秒，设备端不初始化或使用 VAD/KWS。
+录音中的静音由 OpenWaifuD 的 Whisper VAD 在识别时过滤。
 
 OpenWaifuD 的 Agent 回复通过 Write 特征以 `OWT` 二进制流下发：开始帧声明
 PCM 格式与总长度，数据帧携带递增序号，结束帧确认长度。设备使用 PSRAM
-环形缓冲边收边播；流 ID、序号、格式或长度不一致时丢弃该次播放。播放期间
-KWS 暂停，扬声器排空后自动恢复关键词检测，防止设备回复触发自身唤醒。
+环形缓冲边收边播；流 ID、序号、格式或长度不一致时丢弃该次播放。
 
 ### 两条泳道
 

@@ -165,9 +165,9 @@ static const avatar_seq_t sg_sequences[OPENWAIFU_AVATAR_STATE_MAX] = {
         .duration_ms = 720,
     },
     [OPENWAIFU_AVATAR_ERROR] = {
-        .frames      = sg_confused_frames,
-        .frame_count = 8,
-        .duration_ms = 1200,
+        .frames      = sg_error_frames,
+        .frame_count = 7,
+        .duration_ms = 700,
     },
     [OPENWAIFU_AVATAR_CELEBRATION] = {
         .frames      = sg_celebration_frames,
@@ -175,9 +175,9 @@ static const avatar_seq_t sg_sequences[OPENWAIFU_AVATAR_STATE_MAX] = {
         .duration_ms = 960,
     },
     [OPENWAIFU_AVATAR_CONFUSED] = {
-        .frames      = sg_error_frames,
-        .frame_count = 7,
-        .duration_ms = 700,
+        .frames      = sg_confused_frames,
+        .frame_count = 8,
+        .duration_ms = 1200,
     },
     [OPENWAIFU_AVATAR_MOYU] = {
         .frames      = sg_moyu_frames,
