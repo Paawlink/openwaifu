@@ -12,6 +12,7 @@
 #include "tkl_vad.h"
 
 #include "board_com_api.h"
+#include "tdl_button_manage.h"
 #include "tdl_audio_manage.h"
 
 #include "openwaifu_ble.h"
@@ -57,6 +58,7 @@ static TUYA_RINGBUFF_T sg_audio_ring = NULL;
 static MUTEX_HANDLE sg_audio_mutex = NULL;
 static SEM_HANDLE sg_audio_sem = NULL;
 static THREAD_HANDLE sg_audio_thread = NULL;
+static TDL_BUTTON_HANDLE sg_button_handle = NULL;
 static uint32_t sg_audio_dropped = 0;
 static TKL_VAD_CONFIG_T sg_vad_config = {0};
 static TUYA_RINGBUFF_T sg_tts_ring = NULL;
@@ -398,6 +400,23 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
     }
 }
 
+static void __request_wakeup_capture(const char *source)
+{
+    if (!sg_capture_busy && !sg_recording && !sg_record_requested &&
+        openwaifu_ble_is_connected()) {
+        sg_capture_busy = true;
+        sg_record_requested = true;
+        tkl_kws_disable();
+        PR_NOTICE("Wake capture queued by %s; KWS paused", source);
+        tal_semaphore_post(sg_audio_sem);
+    } else {
+        PR_WARN("Wake request ignored from %s: busy=%d recording=%d requested=%d ble=%d",
+                source,
+                sg_capture_busy, sg_recording, sg_record_requested,
+                openwaifu_ble_is_connected());
+    }
+}
+
 static void __wakeup_word_detected(TKL_KWS_WAKEUP_WORD_E wakeup_word)
 {
     if (wakeup_word <= TKL_KWS_WAKEUP_WORD_UNKNOWN || wakeup_word >= TKL_KWS_WAKEUP_WORD_MAX) {
@@ -405,17 +424,16 @@ static void __wakeup_word_detected(TKL_KWS_WAKEUP_WORD_E wakeup_word)
     }
 
     PR_NOTICE("Wake word detected: %d", wakeup_word);
-    if (!sg_capture_busy && !sg_recording && !sg_record_requested &&
-        openwaifu_ble_is_connected()) {
-        sg_capture_busy = true;
-        sg_record_requested = true;
-        tkl_kws_disable();
-        PR_NOTICE("Wake capture queued; KWS paused");
-        tal_semaphore_post(sg_audio_sem);
-    } else {
-        PR_WARN("Wake ignored: busy=%d recording=%d requested=%d ble=%d",
-                sg_capture_busy, sg_recording, sg_record_requested,
-                openwaifu_ble_is_connected());
+    __request_wakeup_capture("kws");
+}
+
+static void __wakeup_button_event(char *name, TDL_BUTTON_TOUCH_EVENT_E event, void *argc)
+{
+    (void)argc;
+
+    if (event == TDL_BUTTON_PRESS_SINGLE_CLICK) {
+        PR_NOTICE("Wake button clicked: %s", name);
+        __request_wakeup_capture("button");
     }
 }
 
@@ -611,6 +629,21 @@ OPERATE_RET openwaifu_wakeup_init(void)
     if (rt != OPRT_OK) {
         goto init_failed;
     }
+
+    TDL_BUTTON_CFG_T button_cfg = {
+        .long_start_valid_time = 3000,
+        .long_keep_timer = 1000,
+        .button_debounce_time = 50,
+        .button_repeat_valid_count = 0,
+        .button_repeat_valid_time = 500,
+    };
+    rt = tdl_button_create(BUTTON_NAME, &button_cfg, &sg_button_handle);
+    if (rt != OPRT_OK) {
+        PR_ERR("Wake button init failed: %d", rt);
+        goto init_failed;
+    }
+    tdl_button_event_register(sg_button_handle, TDL_BUTTON_PRESS_SINGLE_CLICK,
+                              __wakeup_button_event);
 
     sg_wakeup_enabled = true;
     PR_NOTICE("Local wake word ready: Ni Hao Tuya");
