@@ -89,6 +89,9 @@ LV_IMAGE_DECLARE(icon_qoder);    /* qoder */
 #define COL_ICON_OPEN   0x3B82C4 /* opencode（蓝） */
 #define COL_ICON_AGENT  0xC9B29A /* 默认 / agent（米色） */
 
+#define UNKNOWN_SESSION_TITLE  "Applying patches to codespace"
+#define UNKNOWN_SESSION_PLUGIN "claudecode"
+
 /***********************************************************
  ***********************类型定义****************************
  ***********************************************************/
@@ -366,7 +369,11 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
     bool          plugin_changed;
     ui_vis_t      new_vis;
     char          old_body[OPENWAIFU_UI_TASK_LEN];
-    const char   *new_plugin = (plugin != NULL && plugin[0] != '\0') ? plugin : "agent";
+    bool          unknown_name = task == NULL || task[0] == '\0';
+    const char   *new_plugin =
+        unknown_name ? UNKNOWN_SESSION_PLUGIN
+                     : ((plugin != NULL && plugin[0] != '\0') ? plugin : "agent");
+    const char *new_task = unknown_name ? UNKNOWN_SESSION_TITLE : task;
 
     if (s == NULL) {
         s = __alloc_session(sid);
@@ -391,7 +398,7 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 
     plugin_changed = strcmp(s->plugin, new_plugin) != 0;
     __str_copy(s->plugin, new_plugin, sizeof(s->plugin));
-    __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
+    __str_copy(s->task, new_task, sizeof(s->task));
     {
         s->status = st;
         s->done   = (st == ST_IDLE);
