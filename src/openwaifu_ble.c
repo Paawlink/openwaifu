@@ -30,6 +30,8 @@
  ***********************************************************/
 static MUTEX_HANDLE sg_msg_mutex     = NULL;  /* 保护下方共享消息状态 */
 static bool         sg_ble_connected = false; /* 当前 BLE 连接状态 */
+static volatile bool sg_notify_enabled = false; /* 主机是否已订阅 Notify */
+static OPENWAIFU_BLE_SUBSCRIBE_CB sg_subscribe_cb = NULL; /* 订阅回调 */
 
 /* 命令行环形缓冲：BLE 任务写入尾部，UI 任务从头部取出（先进先出）。 */
 static char     sg_ring[OPENWAIFU_BLE_QUEUE_LEN][OPENWAIFU_BLE_MAX_MSG_LEN + 1];
@@ -208,7 +210,8 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
 
     case TAL_BLE_EVT_DISCONNECT: {
         /* 断开连接后自动恢复广播，方便下次重连 */
-        sg_ble_connected = false;
+        sg_ble_connected  = false;
+        sg_notify_enabled = false;
         PR_NOTICE("BLE disconnected (reason=0x%02X), restarting advertising",
                   p_event->ble_event.disconnect.reason);
         TUYA_CALL_ERR_LOG(tal_ble_advertising_start(TUYAOS_BLE_DEFAULT_ADV_PARAM));
@@ -221,9 +224,16 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
     }
 
     case TAL_BLE_EVT_SUBSCRIBE: {
+        bool subscribed = p_event->ble_event.subscribe.cur_notify ? true : false;
+
         PR_NOTICE("BLE subscribe: notify %u->%u",
                   p_event->ble_event.subscribe.prev_notify,
                   p_event->ble_event.subscribe.cur_notify);
+        sg_notify_enabled = subscribed;
+        /* 主机刚订阅时回调一次，便于立即回传设备当前状态快照 */
+        if (subscribed && sg_subscribe_cb != NULL) {
+            sg_subscribe_cb();
+        }
         break;
     }
 
@@ -255,6 +265,32 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
 BOOL_T openwaifu_ble_is_connected(void)
 {
     return sg_ble_connected ? TRUE : FALSE;
+}
+
+void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb)
+{
+    sg_subscribe_cb = cb;
+}
+
+OPERATE_RET openwaifu_ble_notify(const char *line)
+{
+    TAL_BLE_DATA_T data;
+    size_t         len;
+
+    if (line == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    len = strlen(line);
+    if (len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
+        return OPRT_INVALID_PARM;
+    }
+    if (!sg_ble_connected || !sg_notify_enabled) {
+        return OPRT_COM_ERROR;
+    }
+
+    data.len    = (uint16_t)len;
+    data.p_data = (uint8_t *)line;
+    return tal_ble_server_common_send(&data);
 }
 
 BOOL_T openwaifu_ble_fetch_message(char *out, uint16_t out_size)

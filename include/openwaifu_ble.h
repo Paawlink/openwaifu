@@ -23,6 +23,14 @@ extern "C" {
 #define OPENWAIFU_BLE_MAX_MSG_LEN 240
 
 /**
+ * @brief 主机订阅 Notify 特征时的回调类型。
+ *
+ * 回调运行在 BLE 协议栈任务上下文中，仅适合做轻量操作
+ * （如立即上报一次状态），不可操作 LVGL 对象。
+ */
+typedef void (*OPENWAIFU_BLE_SUBSCRIBE_CB)(void);
+
+/**
  * @brief 初始化 BLE 从机并开始广播。
  *
  * 内部会完成 KV 存储、软件定时器、工作队列以及蓝牙协议栈的初始化，
@@ -50,6 +58,27 @@ BOOL_T openwaifu_ble_is_connected(void);
  * @return TRUE 表示有新命令并已拷贝到 out；FALSE 表示队列为空。
  */
 BOOL_T openwaifu_ble_fetch_message(char *out, uint16_t out_size);
+
+/**
+ * @brief 注册主机订阅 Notify 时的回调。
+ *
+ * 电脑端（守护进程）订阅 Notify 特征后触发，用于立即回传一次设备
+ * 当前状态快照（如 WiFi 状态），避免主机侧等到下次状态变化才同步。
+ *
+ * @param cb 订阅回调，传 NULL 表示取消注册。
+ */
+void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb);
+
+/**
+ * @brief 通过 Notify 特征向主机发送一行 UTF-8 文本。
+ *
+ * 仅在 BLE 已连接且主机已订阅 Notify 时实际发送，否则静默丢弃并
+ * 返回错误。线程安全，可在任意任务上下文中调用（不可在中断中调用）。
+ *
+ * @param line 以 '\0' 结尾的文本行（超过 OPENWAIFU_BLE_MAX_MSG_LEN 会被拒绝）。
+ * @return OPRT_OK 表示已提交发送，其他值表示未发送。
+ */
+OPERATE_RET openwaifu_ble_notify(const char *line);
 
 #ifdef __cplusplus
 }

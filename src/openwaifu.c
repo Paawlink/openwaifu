@@ -6,8 +6,10 @@
  *   1. 日志与板级硬件（board_register_hardware）
  *   2. LVGL 图形界面（openwaifu_ui，任务清单）
  *   3. BLE 从机（openwaifu_ble，接收电脑端推送的 Agent 信息）
+ *   4. WiFi STA（openwaifu_wifi，按 BLE 下发的凭据联网并回传状态）
  *
- * 具体的 BLE 收发逻辑见 openwaifu_ble.c，界面逻辑见 openwaifu_ui.c。
+ * 具体的 BLE 收发逻辑见 openwaifu_ble.c，界面逻辑见 openwaifu_ui.c，
+ * WiFi 配网与重连逻辑见 openwaifu_wifi.c。
  *
  * @copyright Copyright (c) 2021-2024 Tuya Inc. All Rights Reserved.
  */
@@ -23,6 +25,7 @@
 
 #include "openwaifu_ble.h"
 #include "openwaifu_ui.h"
+#include "openwaifu_wifi.h"
 
 /**
  * @brief 应用主流程。
@@ -54,6 +57,14 @@ void user_main(void)
         PR_ERR("BLE init failed, continuing without BLE");
     } else {
         PR_NOTICE("OpenWaifu BLE Peripheral initialized");
+    }
+
+    /* 初始化 WiFi STA（依赖 BLE init 中完成的 KV 初始化）；
+     * 失败时仅丢失联网能力，不影响看板与 BLE 功能 */
+    if (openwaifu_wifi_init() != OPRT_OK) {
+        PR_ERR("WiFi init failed, continuing without WiFi");
+    } else {
+        PR_NOTICE("OpenWaifu WiFi Station initialized");
     }
 }
 
