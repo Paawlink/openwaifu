@@ -29,9 +29,10 @@
  ***********************变量定义****************************
  ***********************************************************/
 static MUTEX_HANDLE sg_msg_mutex     = NULL;  /* 保护下方共享消息状态 */
+static MUTEX_HANDLE sg_notify_mutex  = NULL;  /* 串行化文本与音频 Notify */
 static bool         sg_ble_connected = false; /* 当前 BLE 连接状态 */
 static volatile bool sg_notify_enabled = false; /* 主机是否已订阅 Notify */
-static OPENWAIFU_BLE_SUBSCRIBE_CB sg_subscribe_cb = NULL; /* 订阅回调 */
+static OPENWAIFU_BLE_BINARY_CB sg_binary_cb = NULL;
 
 /* 命令行环形缓冲：BLE 任务写入尾部，UI 任务从头部取出（先进先出）。 */
 static char     sg_ring[OPENWAIFU_BLE_QUEUE_LEN][OPENWAIFU_BLE_MAX_MSG_LEN + 1];
@@ -119,22 +120,6 @@ static bool __utf8_validate(const uint8_t *data, uint16_t len)
 }
 
 /**
- * @brief 将收到的 BLE 数据以 HEX + UTF-8 文本形式打印到串口日志。
- */
-static void __ble_log_payload(const uint8_t *data, uint16_t len)
-{
-    uint16_t i;
-
-    PR_NOTICE("BLE received %u bytes", len);
-    PR_DEBUG_RAW("BLE RX HEX:");
-    for (i = 0; i < len; i++) {
-        PR_DEBUG_RAW(" %02X", data[i]);
-    }
-    PR_DEBUG_RAW("\r\n");
-    PR_NOTICE("BLE RX UTF-8: %.*s", (int)len, (const char *)data);
-}
-
-/**
  * @brief 将收到的命令行写入环形缓冲区尾部，供 UI 刷新时按序取用。
  *
  * 缓冲区已满时丢弃最旧一条，保证最新命令一定能入队（避免看板状态卡死）。
@@ -186,7 +171,6 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
         };
 
         if (p_event->ble_event.init == OPRT_OK) {
-            PR_NOTICE("BLE stack ready, starting OpenWaifu advertising");
             TUYA_CALL_ERR_LOG(tal_ble_advertising_data_set(&adv, &rsp));
             TUYA_CALL_ERR_LOG(tal_ble_advertising_start(TUYAOS_BLE_DEFAULT_ADV_PARAM));
         } else {
@@ -198,10 +182,7 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
     case TAL_BLE_EVT_PERIPHERAL_CONNECT: {
         /* 主机（电脑）连接结果 */
         sg_ble_connected = (p_event->ble_event.connect.result == OPRT_OK);
-        if (sg_ble_connected) {
-            PR_NOTICE("BLE connected, conn_handle=0x%04X",
-                      p_event->ble_event.connect.peer.conn_handle);
-        } else {
+        if (!sg_ble_connected) {
             PR_WARN("BLE connection failed, result=%d",
                     p_event->ble_event.connect.result);
         }
@@ -212,28 +193,16 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
         /* 断开连接后自动恢复广播，方便下次重连 */
         sg_ble_connected  = false;
         sg_notify_enabled = false;
-        PR_NOTICE("BLE disconnected (reason=0x%02X), restarting advertising",
-                  p_event->ble_event.disconnect.reason);
         TUYA_CALL_ERR_LOG(tal_ble_advertising_start(TUYAOS_BLE_DEFAULT_ADV_PARAM));
         break;
     }
 
     case TAL_BLE_EVT_MTU_REQUEST: {
-        PR_DEBUG("BLE MTU exchange request: %u", p_event->ble_event.exchange_mtu.mtu);
         break;
     }
 
     case TAL_BLE_EVT_SUBSCRIBE: {
-        bool subscribed = p_event->ble_event.subscribe.cur_notify ? true : false;
-
-        PR_NOTICE("BLE subscribe: notify %u->%u",
-                  p_event->ble_event.subscribe.prev_notify,
-                  p_event->ble_event.subscribe.cur_notify);
-        sg_notify_enabled = subscribed;
-        /* 主机刚订阅时回调一次，便于立即回传设备当前状态快照 */
-        if (subscribed && sg_subscribe_cb != NULL) {
-            sg_subscribe_cb();
-        }
+        sg_notify_enabled = p_event->ble_event.subscribe.cur_notify ? true : false;
         break;
     }
 
@@ -246,13 +215,18 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
             break;
         }
 
-        if (!__utf8_validate(report->p_data, report->len)) {
-            PR_WARN("BLE RX payload is not valid UTF-8, dropping");
-            __ble_log_payload(report->p_data, report->len);
+        if (report->len >= 3 && memcmp(report->p_data, "OWT", 3) == 0) {
+            if (sg_binary_cb != NULL) {
+                sg_binary_cb(report->p_data, report->len);
+            }
             break;
         }
 
-        __ble_log_payload(report->p_data, report->len);
+        if (!__utf8_validate(report->p_data, report->len)) {
+            PR_WARN("BLE RX payload is not valid UTF-8, dropping");
+            break;
+        }
+
         __ble_store_message(report->p_data, report->len);
         break;
     }
@@ -267,30 +241,30 @@ BOOL_T openwaifu_ble_is_connected(void)
     return sg_ble_connected ? TRUE : FALSE;
 }
 
-void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb)
+void openwaifu_ble_set_binary_cb(OPENWAIFU_BLE_BINARY_CB cb)
 {
-    sg_subscribe_cb = cb;
+    sg_binary_cb = cb;
 }
 
-OPERATE_RET openwaifu_ble_notify(const char *line)
+OPERATE_RET openwaifu_ble_notify_data(const uint8_t *data, uint16_t len)
 {
-    TAL_BLE_DATA_T data;
-    size_t         len;
+    OPERATE_RET rt;
+    TAL_BLE_DATA_T packet;
 
-    if (line == NULL) {
+    if (data == NULL || len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
         return OPRT_INVALID_PARM;
     }
-    len = strlen(line);
-    if (len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
-        return OPRT_INVALID_PARM;
-    }
-    if (!sg_ble_connected || !sg_notify_enabled) {
+    if (!sg_ble_connected || !sg_notify_enabled || sg_notify_mutex == NULL) {
         return OPRT_COM_ERROR;
     }
 
-    data.len    = (uint16_t)len;
-    data.p_data = (uint8_t *)line;
-    return tal_ble_server_common_send(&data);
+    packet.len    = len;
+    packet.p_data = (uint8_t *)data;
+
+    tal_mutex_lock(sg_notify_mutex);
+    rt = tal_ble_server_common_send(&packet);
+    tal_mutex_unlock(sg_notify_mutex);
+    return rt;
 }
 
 BOOL_T openwaifu_ble_fetch_message(char *out, uint16_t out_size)
@@ -325,6 +299,7 @@ OPERATE_RET openwaifu_ble_init(void)
 
     /* 消息缓冲区互斥锁：BLE 任务写、LVGL 任务读 */
     TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_msg_mutex));
+    TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_notify_mutex));
 
     /* 蓝牙依赖 KV 存储、软件定时器与工作队列 */
     TUYA_CALL_ERR_RETURN(tal_kv_init(&(tal_kv_cfg_t){

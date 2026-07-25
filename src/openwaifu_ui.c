@@ -22,8 +22,6 @@
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
  *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/X=Confused/D=Done）
- *   W|<ssid>|<pass>                    WiFi 配网（百分号编码的凭据，交给 openwaifu_wifi 模块）
- *   F                                  忘记网络（断开 WiFi 并清除已保存的凭据）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
  * <ev> 为单字符事件码：E=出错 X=取消 D=完成（驱动桌宠事件形象）。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
@@ -41,7 +39,14 @@
 #include "openwaifu_avatar.h"
 #include "openwaifu_ble.h"
 #include "openwaifu_font.h"
-#include "openwaifu_wifi.h"
+#include "openwaifu_wakeup.h"
+
+/* 右栏会话列表的插件图标资源（27x27 内嵌 PNG，见 src/assets/icon_*.c）。 */
+LV_IMAGE_DECLARE(icon_claude);   /* claudecode */
+LV_IMAGE_DECLARE(icon_openai);   /* codex */
+LV_IMAGE_DECLARE(icon_opencode); /* opencode */
+LV_IMAGE_DECLARE(icon_qoder);    /* qoder */
+LV_IMAGE_DECLARE(icon_tools);    /* tools */
 
 /***********************************************************
  *************************宏定义****************************
@@ -81,6 +86,9 @@
 #define COL_ICON_CODEX  0x10A37F /* codex（绿） */
 #define COL_ICON_OPEN   0x3B82C4 /* opencode（蓝） */
 #define COL_ICON_AGENT  0xC9B29A /* 默认 / agent（米色） */
+
+#define UNKNOWN_SESSION_TITLE  "Applying patches"
+#define UNKNOWN_SESSION_PLUGIN "tools"
 
 /***********************************************************
  ***********************类型定义****************************
@@ -125,6 +133,7 @@ typedef struct {
     bool        done;        /* 收到 idle/完成后置位 */
     ui_vis_t    vis;         /* 缓存的可视档位，用于判断是否需要重建行 */
     lv_obj_t   *row;         /* 行容器（reconcile 时复用，避免重建导致 indicator 闪烁） */
+    lv_obj_t   *plugin_icon; /* 插件图标（plugin 变化时原地替换） */
     lv_obj_t   *title_label; /* 任务主题标签（可就地更新文本） */
     lv_obj_t   *indicator;   /* 状态指示灯（vis 变化时原地替换） */
     uint32_t    elapsed;     /* 运行时长（秒），详情页展示 */
@@ -144,8 +153,8 @@ static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
 static bool         sg_structure_dirty = true; /* 会话增删时需协调列表 */
 static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
-static lv_obj_t    *sg_wifi_icon       = NULL; /* 左栏人物框右上角的 WiFi 已连接图标 */
-static bool         sg_wifi_last       = false; /* 上次已展示的 WiFi 连接状态 */
+static lv_obj_t    *sg_mic_icon        = NULL; /* 左栏人物框右上角的本地关键词监听图标 */
+static bool         sg_mic_last        = false; /* 上次已展示的关键词监听状态 */
 
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
@@ -197,6 +206,7 @@ static void __avatar_trigger_event(openwaifu_avatar_state_t state);
 static void __avatar_update_base(void);
 /* 前向声明：指示灯构建函数在视图构建小节定义，此处先声明以供会话更新逻辑原地替换。 */
 static lv_obj_t *__make_indicator(lv_obj_t *parent, ui_vis_t vis);
+static lv_obj_t *__make_icon(lv_obj_t *parent, const char *plugin);
 
 /** 手写的有界字符串拷贝（避免引入额外依赖，保证以 '\0' 结尾）。 */
 static void __str_copy(char *dst, const char *src, uint32_t cap)
@@ -248,7 +258,7 @@ static ui_vis_t __vis_from_status(ui_status_t s, bool done)
     return VIS_RUNNING;
 }
 
-/** 按插件类型返回图标底色。 */
+/** 按插件类型返回图标底色（仅用于无对应软件图标时的回退方块）。 */
 static lv_color_t __plugin_color(const char *plugin)
 {
     if (strcmp(plugin, "claudecode") == 0) {
@@ -261,6 +271,27 @@ static lv_color_t __plugin_color(const char *plugin)
         return lv_color_hex(COL_ICON_OPEN);
     }
     return lv_color_hex(COL_ICON_AGENT);
+}
+
+/** 按插件类型返回对应真实软件图标；未知类型返回 NULL（回退到彩色方块）。 */
+static const lv_image_dsc_t *__plugin_icon_src(const char *plugin)
+{
+    if (strcmp(plugin, "claudecode") == 0) {
+        return &icon_claude;
+    }
+    if (strcmp(plugin, "codex") == 0) {
+        return &icon_openai;
+    }
+    if (strcmp(plugin, "opencode") == 0) {
+        return &icon_opencode;
+    }
+    if (strcmp(plugin, "qoder") == 0) {
+        return &icon_qoder;
+    }
+    if (strcmp(plugin, "tools") == 0) {
+        return &icon_tools;
+    }
+    return NULL;
 }
 
 /***********************************************************
@@ -289,6 +320,7 @@ static ui_session_t *__alloc_session(const char *sid)
             if (sg_sessions[i].row != NULL) {
                 lv_obj_delete(sg_sessions[i].row);
                 sg_sessions[i].row       = NULL;
+                sg_sessions[i].plugin_icon = NULL;
                 sg_sessions[i].title_label = NULL;
                 sg_sessions[i].indicator   = NULL;
             }
@@ -333,8 +365,14 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 {
     ui_session_t *s      = __find_session(sid);
     bool          is_new = false;
+    bool          plugin_changed;
     ui_vis_t      new_vis;
     char          old_body[OPENWAIFU_UI_TASK_LEN];
+    bool          unknown_name = task == NULL || task[0] == '\0';
+    const char   *new_plugin =
+        unknown_name ? UNKNOWN_SESSION_PLUGIN
+                     : ((plugin != NULL && plugin[0] != '\0') ? plugin : "agent");
+    const char *new_task = unknown_name ? UNKNOWN_SESSION_TITLE : task;
 
     if (s == NULL) {
         s = __alloc_session(sid);
@@ -357,9 +395,9 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
         old_body[0] = '\0';
     }
 
-    __str_copy(s->plugin, (plugin != NULL && plugin[0] != '\0') ? plugin : "agent",
-               sizeof(s->plugin));
-    __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
+    plugin_changed = strcmp(s->plugin, new_plugin) != 0;
+    __str_copy(s->plugin, new_plugin, sizeof(s->plugin));
+    __str_copy(s->task, new_task, sizeof(s->task));
     {
         s->status = st;
         s->done   = (st == ST_IDLE);
@@ -395,15 +433,25 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 
         if (need_rebuild) {
             sg_structure_dirty = true;
-        } else if (s->title_label != NULL) {
-            const char *body = s->task[0] != '\0' ? s->task
-                                                  : (s->plugin[0] != '\0' ? s->plugin : "—");
-            /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
-             * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
-             * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
-             * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
-            if (strcmp(old_body, body) != 0) {
-                lv_label_set_text(s->title_label, body);
+        } else {
+            if (plugin_changed && s->row != NULL) {
+                if (s->plugin_icon != NULL) {
+                    lv_obj_delete(s->plugin_icon);
+                }
+                s->plugin_icon = __make_icon(s->row, s->plugin);
+                lv_obj_move_to_index(s->plugin_icon, 0);
+            }
+
+            if (s->title_label != NULL) {
+                const char *body = s->task[0] != '\0' ? s->task
+                                                      : (s->plugin[0] != '\0' ? s->plugin : "—");
+                /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
+                 * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
+                 * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
+                 * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
+                if (strcmp(old_body, body) != 0) {
+                    lv_label_set_text(s->title_label, body);
+                }
             }
         }
     }
@@ -541,25 +589,6 @@ static void __ui_handle_line(char *line)
         return;
     }
 
-    if (cmd == 'W' && line[1] == '|') {
-        /* W|<ssid>|<pass> —— 百分号编码的 WiFi 凭据，解码由 wifi 模块完成。 */
-        char *ssid = line + 2;
-        char *sep  = strchr(ssid, '|');
-
-        if (sep == NULL) {
-            return; /* 缺少密码字段，视为非法命令 */
-        }
-        *sep = '\0';
-        openwaifu_wifi_provision(ssid, sep + 1);
-        return;
-    }
-
-    if (cmd == 'F' && line[1] == '\0') {
-        /* 忘记网络：断开 WiFi 并清除已保存的凭据。 */
-        openwaifu_wifi_forget();
-        return;
-    }
-
     if (cmd == 'S' && line[1] == '|') {
         /* S|sid|st|elapsed|plugin|task —— 去掉 "S|" 后按 4 个分隔符切出 5 段 */
         char *fields[5];
@@ -683,9 +712,21 @@ static lv_obj_t *__make_indicator(lv_obj_t *parent, ui_vis_t vis)
     }
 }
 
-/** 创建插件图标（彩色圆角方块 + 近黑描边），色彩由 plugin_type 决定。 */
+/** 创建插件图标：已知插件用对应真实软件图标（27x27 PNG），
+ *  未知插件回退到彩色圆角方块 + 近黑描边（色彩由 plugin_type 决定）。 */
 static lv_obj_t *__make_icon(lv_obj_t *parent, const char *plugin)
 {
+    const lv_image_dsc_t *src = __plugin_icon_src(plugin);
+
+    if (src != NULL) {
+        lv_obj_t *img = lv_image_create(parent);
+
+        lv_image_set_src(img, src);
+        lv_obj_set_size(img, 27, 27);
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+        return img;
+    }
+
     lv_obj_t *icon = lv_obj_create(parent);
 
     lv_obj_set_size(icon, 26, 26);
@@ -764,20 +805,62 @@ static void __rebuild_legend(void)
 static void __build_avatar(lv_obj_t *parent)
 {
     lv_obj_t *avatar = __make_card(parent);
+    lv_obj_t *mic_body;
+    lv_obj_t *mic_yoke;
+    lv_obj_t *mic_stem;
+    lv_obj_t *mic_base;
 
     lv_obj_set_width(avatar, 188);
     lv_obj_set_height(avatar, LV_PCT(100));
     /* 虚拟形象动画：由 openwaifu_avatar 模块管理帧序列，后续可按状态切换序列。 */
     openwaifu_avatar_create(avatar);
 
-    /* 右上角 WiFi 已连接图标：默认隐藏，由刷新定时器按连接状态切换显隐。
+    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。
      * 后于形象动画创建，保证图标始终浮在动画上层。 */
-    sg_wifi_icon = lv_label_create(avatar);
-    lv_label_set_text(sg_wifi_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(sg_wifi_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sg_wifi_icon, lv_color_hex(COL_DONE), 0);
-    lv_obj_align(sg_wifi_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
+    sg_mic_icon = __make_plain(avatar);
+    lv_obj_set_size(sg_mic_icon, 16, 16);
+    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
+
+    mic_body = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_body, 6, 9);
+    lv_obj_align(mic_body, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(mic_body, 3, 0);
+    lv_obj_set_style_bg_opa(mic_body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(mic_body, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_border_width(mic_body, 2, 0);
+    lv_obj_set_style_pad_all(mic_body, 0, 0);
+    lv_obj_clear_flag(mic_body, LV_OBJ_FLAG_SCROLLABLE);
+
+    mic_yoke = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_yoke, 10, 7);
+    lv_obj_align(mic_yoke, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_radius(mic_yoke, 5, 0);
+    lv_obj_set_style_bg_opa(mic_yoke, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(mic_yoke, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_border_width(mic_yoke, 2, 0);
+    lv_obj_set_style_border_side(mic_yoke, LV_BORDER_SIDE_BOTTOM |
+                                           LV_BORDER_SIDE_LEFT |
+                                           LV_BORDER_SIDE_RIGHT, 0);
+    lv_obj_set_style_pad_all(mic_yoke, 0, 0);
+    lv_obj_clear_flag(mic_yoke, LV_OBJ_FLAG_SCROLLABLE);
+
+    mic_stem = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_stem, 2, 3);
+    lv_obj_align(mic_stem, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(mic_stem, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_bg_opa(mic_stem, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mic_stem, 0, 0);
+    lv_obj_set_style_pad_all(mic_stem, 0, 0);
+
+    mic_base = lv_obj_create(sg_mic_icon);
+    lv_obj_set_size(mic_base, 8, 2);
+    lv_obj_align(mic_base, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(mic_base, 1, 0);
+    lv_obj_set_style_bg_color(mic_base, lv_color_hex(COL_DONE), 0);
+    lv_obj_set_style_bg_opa(mic_base, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mic_base, 0, 0);
+    lv_obj_set_style_pad_all(mic_base, 0, 0);
 }
 
 /** 按当前会话表协调右栏任务清单（增量删除/创建/排序行，保留已有行的 indicator 动画）。 */
@@ -793,6 +876,7 @@ static void __rebuild_list(void)
         if (!sg_sessions[i].used && sg_sessions[i].row != NULL) {
             lv_obj_delete(sg_sessions[i].row);
             sg_sessions[i].row         = NULL;
+            sg_sessions[i].plugin_icon = NULL;
             sg_sessions[i].title_label = NULL;
             sg_sessions[i].indicator   = NULL;
         }
@@ -862,7 +946,7 @@ static void __rebuild_list(void)
             lv_obj_add_event_cb(row, __row_click_cb, LV_EVENT_CLICKED, s);
 
             /* 插件图标（左，定宽彩色方块） */
-            __make_icon(row, s->plugin);
+            s->plugin_icon = __make_icon(row, s->plugin);
 
             /* 任务主题（主体，占据剩余空间，超长省略）。任务为空时回退到插件名，
              * 避免主体长期只显示占位符。 */
@@ -1342,16 +1426,16 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __rebuild_legend();
     }
 
-    /* WiFi 连接状态变化时切换人物框右上角的 WiFi 图标显隐。 */
-    if (sg_wifi_icon != NULL) {
-        bool wifi_on = openwaifu_wifi_is_connected() ? true : false;
+    /* 端侧关键词唤醒成功运行时，在人物框右上角显示麦克风图标。 */
+    if (sg_mic_icon != NULL) {
+        bool mic_on = openwaifu_wakeup_is_enabled() ? true : false;
 
-        if (wifi_on != sg_wifi_last) {
-            sg_wifi_last = wifi_on;
-            if (wifi_on) {
-                lv_obj_clear_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
+        if (mic_on != sg_mic_last) {
+            sg_mic_last = mic_on;
+            if (mic_on) {
+                lv_obj_clear_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
             } else {
-                lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
             }
         }
     }

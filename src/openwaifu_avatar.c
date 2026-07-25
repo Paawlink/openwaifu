@@ -165,9 +165,9 @@ static const avatar_seq_t sg_sequences[OPENWAIFU_AVATAR_STATE_MAX] = {
         .duration_ms = 720,
     },
     [OPENWAIFU_AVATAR_ERROR] = {
-        .frames      = sg_error_frames,
-        .frame_count = 7,
-        .duration_ms = 700,  /* 略快，故障感 */
+        .frames      = sg_confused_frames,
+        .frame_count = 8,
+        .duration_ms = 1200,
     },
     [OPENWAIFU_AVATAR_CELEBRATION] = {
         .frames      = sg_celebration_frames,
@@ -175,9 +175,9 @@ static const avatar_seq_t sg_sequences[OPENWAIFU_AVATAR_STATE_MAX] = {
         .duration_ms = 960,
     },
     [OPENWAIFU_AVATAR_CONFUSED] = {
-        .frames      = sg_confused_frames,
-        .frame_count = 8,
-        .duration_ms = 1200, /* 略慢，困惑感 */
+        .frames      = sg_error_frames,
+        .frame_count = 7,
+        .duration_ms = 700,
     },
     [OPENWAIFU_AVATAR_MOYU] = {
         .frames      = sg_moyu_frames,
@@ -338,7 +338,7 @@ lv_obj_t *openwaifu_avatar_create(lv_obj_t *parent)
     /* animimg 继承自 image：去掉主题默认样式，仅按帧尺寸占位、居中显示。 */
     lv_obj_remove_style_all(sg_animimg);
     lv_obj_set_size(sg_animimg, AVATAR_FRAME_W, AVATAR_FRAME_H);
-    lv_obj_align(sg_animimg, LV_ALIGN_CENTER, 0, -12);
+    lv_obj_align(sg_animimg, LV_ALIGN_CENTER, 0, -6);
 
     /* 首次直接应用，无需淡入淡出 */
     sg_state           = OPENWAIFU_AVATAR_STATE_MAX; /* 强制首次应用 */
