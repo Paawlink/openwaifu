@@ -39,7 +39,6 @@
 #include "openwaifu_avatar.h"
 #include "openwaifu_ble.h"
 #include "openwaifu_font.h"
-#include "openwaifu_wakeup.h"
 
 /* 右栏会话列表的插件图标资源（27x27 内嵌 PNG，见 src/assets/icon_*.c）。 */
 LV_IMAGE_DECLARE(icon_claude);   /* claudecode */
@@ -153,8 +152,6 @@ static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
 static bool         sg_structure_dirty = true; /* 会话增删时需协调列表 */
 static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
-static lv_obj_t    *sg_mic_icon        = NULL; /* 左栏人物框右上角的本地关键词监听图标 */
-static bool         sg_mic_last        = false; /* 上次已展示的关键词监听状态 */
 
 /* 详情页状态 */
 static lv_obj_t    *sg_main_screen     = NULL; /* 主屏幕（任务清单），用于从详情页返回 */
@@ -805,62 +802,11 @@ static void __rebuild_legend(void)
 static void __build_avatar(lv_obj_t *parent)
 {
     lv_obj_t *avatar = __make_card(parent);
-    lv_obj_t *mic_body;
-    lv_obj_t *mic_yoke;
-    lv_obj_t *mic_stem;
-    lv_obj_t *mic_base;
 
     lv_obj_set_width(avatar, 188);
     lv_obj_set_height(avatar, LV_PCT(100));
     /* 虚拟形象动画：由 openwaifu_avatar 模块管理帧序列，后续可按状态切换序列。 */
     openwaifu_avatar_create(avatar);
-
-    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。
-     * 后于形象动画创建，保证图标始终浮在动画上层。 */
-    sg_mic_icon = __make_plain(avatar);
-    lv_obj_set_size(sg_mic_icon, 16, 16);
-    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-
-    mic_body = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_body, 6, 9);
-    lv_obj_align(mic_body, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_radius(mic_body, 3, 0);
-    lv_obj_set_style_bg_opa(mic_body, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(mic_body, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_border_width(mic_body, 2, 0);
-    lv_obj_set_style_pad_all(mic_body, 0, 0);
-    lv_obj_clear_flag(mic_body, LV_OBJ_FLAG_SCROLLABLE);
-
-    mic_yoke = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_yoke, 10, 7);
-    lv_obj_align(mic_yoke, LV_ALIGN_TOP_MID, 0, 4);
-    lv_obj_set_style_radius(mic_yoke, 5, 0);
-    lv_obj_set_style_bg_opa(mic_yoke, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(mic_yoke, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_border_width(mic_yoke, 2, 0);
-    lv_obj_set_style_border_side(mic_yoke, LV_BORDER_SIDE_BOTTOM |
-                                           LV_BORDER_SIDE_LEFT |
-                                           LV_BORDER_SIDE_RIGHT, 0);
-    lv_obj_set_style_pad_all(mic_yoke, 0, 0);
-    lv_obj_clear_flag(mic_yoke, LV_OBJ_FLAG_SCROLLABLE);
-
-    mic_stem = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_stem, 2, 3);
-    lv_obj_align(mic_stem, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_set_style_bg_color(mic_stem, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_bg_opa(mic_stem, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(mic_stem, 0, 0);
-    lv_obj_set_style_pad_all(mic_stem, 0, 0);
-
-    mic_base = lv_obj_create(sg_mic_icon);
-    lv_obj_set_size(mic_base, 8, 2);
-    lv_obj_align(mic_base, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_radius(mic_base, 1, 0);
-    lv_obj_set_style_bg_color(mic_base, lv_color_hex(COL_DONE), 0);
-    lv_obj_set_style_bg_opa(mic_base, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(mic_base, 0, 0);
-    lv_obj_set_style_pad_all(mic_base, 0, 0);
 }
 
 /** 按当前会话表协调右栏任务清单（增量删除/创建/排序行，保留已有行的 indicator 动画）。 */
@@ -1426,20 +1372,6 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __rebuild_legend();
     }
 
-    /* 端侧关键词唤醒成功运行时，在人物框右上角显示麦克风图标。 */
-    if (sg_mic_icon != NULL) {
-        bool mic_on = openwaifu_wakeup_is_enabled() ? true : false;
-
-        if (mic_on != sg_mic_last) {
-            sg_mic_last = mic_on;
-            if (mic_on) {
-                lv_obj_clear_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-    }
-
     if (sg_structure_dirty) {
         __rebuild_list();
         sg_structure_dirty = false;
@@ -1502,8 +1434,12 @@ void openwaifu_ui_init(void)
                           LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(right, 8, 0);
 
-    /* 任务清单容器：占据右栏剩余空间，超出时可纵向滚动。 */
+    /* 任务清单容器：占据右栏剩余空间，超出时可纵向滚动。
+     * __make_plain 默认清除了 SCROLLABLE 标志，这里需重新开启。 */
     sg_list = __make_plain(right);
+    lv_obj_add_flag(sg_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(sg_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(sg_list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_width(sg_list, LV_PCT(100));
     lv_obj_set_flex_grow(sg_list, 1);
     lv_obj_set_flex_flow(sg_list, LV_FLEX_FLOW_COLUMN);

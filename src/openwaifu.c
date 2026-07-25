@@ -57,9 +57,9 @@ void user_main(void)
         PR_NOTICE("OpenWaifu BLE Peripheral initialized");
     }
 
-    /* 仅启用端侧“你好涂鸦”关键词检测，不启动云端 AI 对话。 */
+    /* 初始化按键触发的音频采集与回复播放。 */
     if (openwaifu_wakeup_init() != OPRT_OK) {
-        PR_ERR("Local wake word init failed, continuing without wakeup");
+        PR_ERR("Button audio init failed, continuing without audio interaction");
     }
 }
 

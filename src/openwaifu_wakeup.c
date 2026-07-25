@@ -1,6 +1,6 @@
 /**
  * @file openwaifu_wakeup.c
- * @brief On-device "Ni Hao Tuya" wake-word detection.
+ * @brief Button-triggered audio capture and playback.
  */
 
 #include "tuya_cloud_types.h"
@@ -8,8 +8,6 @@
 
 #include "tal_api.h"
 #include "tkl_audio.h"
-#include "tkl_kws.h"
-#include "tkl_vad.h"
 
 #include "board_com_api.h"
 #include "tdl_button_manage.h"
@@ -18,8 +16,6 @@
 #include "openwaifu_ble.h"
 #include "openwaifu_wakeup.h"
 
-#define OPENWAIFU_VAD_SPEECH_MIN_MS 200
-#define OPENWAIFU_VAD_NOISE_MIN_MS  300
 #define OPENWAIFU_AUDIO_BUFFER_SIZE  (96 * 1024)
 #define OPENWAIFU_AUDIO_CHUNK_SIZE   230
 #define OPENWAIFU_AUDIO_RECORD_MS      5000
@@ -29,9 +25,6 @@
 #define OPENWAIFU_AUDIO_PROMPT_HZ       880
 #define OPENWAIFU_AUDIO_END_PROMPT_HZ   620
 #define OPENWAIFU_AUDIO_PROMPT_LEVEL    5000
-/* -40 dB gate, the vendor-recommended level for noisy environments. */
-#define OPENWAIFU_VAD_THRESHOLD_LEVEL TKL_AUDIO_VAD_HIGH
-
 #define OPENWAIFU_AUDIO_MAGIC_0 'O'
 #define OPENWAIFU_AUDIO_MAGIC_1 'W'
 #define OPENWAIFU_AUDIO_MAGIC_2 'A'
@@ -49,7 +42,6 @@
 #define OPENWAIFU_TTS_PLAY_FRAME_MS 40
 
 static TDL_AUDIO_HANDLE_T sg_audio_handle = NULL;
-static volatile bool sg_wakeup_enabled = false;
 static volatile bool sg_record_requested = false;
 static volatile bool sg_recording = false;
 static volatile bool sg_capture_busy = false;
@@ -60,7 +52,6 @@ static SEM_HANDLE sg_audio_sem = NULL;
 static THREAD_HANDLE sg_audio_thread = NULL;
 static TDL_BUTTON_HANDLE sg_button_handle = NULL;
 static uint32_t sg_audio_dropped = 0;
-static TKL_VAD_CONFIG_T sg_vad_config = {0};
 static TUYA_RINGBUFF_T sg_tts_ring = NULL;
 static MUTEX_HANDLE sg_tts_mutex = NULL;
 static SEM_HANDLE sg_tts_sem = NULL;
@@ -201,20 +192,6 @@ static void __play_prompt(uint16_t frequency, uint16_t duration_ms)
     PR_NOTICE("Wake prompt end: %u Hz", frequency);
 }
 
-static void __rearm_detection(void)
-{
-    OPERATE_RET vad_stop_rt = tkl_vad_stop();
-    OPERATE_RET vad_start_rt = tkl_vad_start();
-    OPERATE_RET kws_rt = tkl_kws_enable();
-
-    if (vad_stop_rt == OPRT_OK && vad_start_rt == OPRT_OK && kws_rt == OPRT_OK) {
-        PR_NOTICE("Wake detection rearmed");
-    } else {
-        PR_ERR("Wake detection rearm failed: vad_stop=%d vad_start=%d kws=%d",
-               vad_stop_rt, vad_start_rt, kws_rt);
-    }
-}
-
 static void __tts_reset(void)
 {
     tal_mutex_lock(sg_tts_mutex);
@@ -254,7 +231,6 @@ static void __tts_packet_received(const uint8_t *data, uint16_t len)
         sg_tts_stream_id = __get_u32_le(data + 4);
         sg_tts_expected_bytes = __get_u32_le(data + 8);
         sg_tts_active = true;
-        tkl_kws_disable();
         PR_NOTICE("TTS stream %u started: %u bytes", sg_tts_stream_id, sg_tts_expected_bytes);
         tal_semaphore_post(sg_tts_sem);
         return;
@@ -282,7 +258,6 @@ static void __tts_packet_received(const uint8_t *data, uint16_t len)
             PR_ERR("TTS stream packet error: expected=%u received=%u len=%u",
                    sg_tts_next_sequence, sequence, pcm_len);
             __tts_reset();
-            __rearm_detection();
             return;
         }
 
@@ -294,7 +269,6 @@ static void __tts_packet_received(const uint8_t *data, uint16_t len)
         if (written != pcm_len) {
             PR_ERR("TTS ring buffer overflow");
             __tts_reset();
-            __rearm_detection();
             return;
         }
         sg_tts_received_bytes += written;
@@ -306,7 +280,6 @@ static void __tts_packet_received(const uint8_t *data, uint16_t len)
             PR_ERR("TTS stream size mismatch: expected=%u received=%u end=%u",
                    sg_tts_expected_bytes, sg_tts_received_bytes, declared_bytes);
             __tts_reset();
-            __rearm_detection();
             return;
         }
         sg_tts_end_received = true;
@@ -347,7 +320,6 @@ static void __tts_play_task(void *arg)
                 if (tdl_audio_play(sg_audio_handle, frame, read_len) != OPRT_OK) {
                     PR_ERR("TTS speaker playback failed");
                     __tts_reset();
-                    __rearm_detection();
                     break;
                 }
                 tal_system_sleep(read_len * 1000 /
@@ -357,7 +329,6 @@ static void __tts_play_task(void *arg)
                 PR_NOTICE("TTS stream %u playback complete", sg_tts_stream_id);
                 __tts_reset();
                 tal_system_sleep(200);
-                __rearm_detection();
                 break;
             } else {
                 tal_system_sleep(5);
@@ -374,7 +345,6 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
     (void)type;
     (void)status;
 
-    /* T5AI sends the AEC/VAD output to KWS inside the audio driver pipeline. */
     if (!sg_recording || data == NULL || len == 0 || sg_audio_ring == NULL) {
         return;
     }
@@ -406,8 +376,7 @@ static void __request_wakeup_capture(const char *source)
         openwaifu_ble_is_connected()) {
         sg_capture_busy = true;
         sg_record_requested = true;
-        tkl_kws_disable();
-        PR_NOTICE("Wake capture queued by %s; KWS paused", source);
+        PR_NOTICE("Audio capture queued by %s", source);
         tal_semaphore_post(sg_audio_sem);
     } else {
         PR_WARN("Wake request ignored from %s: busy=%d recording=%d requested=%d ble=%d",
@@ -415,16 +384,6 @@ static void __request_wakeup_capture(const char *source)
                 sg_capture_busy, sg_recording, sg_record_requested,
                 openwaifu_ble_is_connected());
     }
-}
-
-static void __wakeup_word_detected(TKL_KWS_WAKEUP_WORD_E wakeup_word)
-{
-    if (wakeup_word <= TKL_KWS_WAKEUP_WORD_UNKNOWN || wakeup_word >= TKL_KWS_WAKEUP_WORD_MAX) {
-        return;
-    }
-
-    PR_NOTICE("Wake word detected: %d", wakeup_word);
-    __request_wakeup_capture("kws");
 }
 
 static void __wakeup_button_event(char *name, TDL_BUTTON_TOUCH_EVENT_E event, void *argc)
@@ -468,7 +427,6 @@ static void __audio_stream_task(void *arg)
         sg_record_requested = false;
         if (!openwaifu_ble_is_connected()) {
             sg_capture_busy = false;
-            __rearm_detection();
             continue;
         }
 
@@ -478,7 +436,6 @@ static void __audio_stream_task(void *arg)
         tal_system_sleep(OPENWAIFU_AUDIO_PROMPT_DELAY_MS);
         if (!openwaifu_ble_is_connected()) {
             sg_capture_busy = false;
-            __rearm_detection();
             continue;
         }
 
@@ -486,7 +443,6 @@ static void __audio_stream_task(void *arg)
         if (__send_audio_start(stream_id) != OPRT_OK) {
             PR_ERR("Wake stream %u start notification failed", stream_id);
             sg_capture_busy = false;
-            __rearm_detection();
             continue;
         }
 
@@ -548,15 +504,12 @@ static void __audio_stream_task(void *arg)
                   sequence, pcm_bytes, sg_audio_dropped);
         __play_prompt(OPENWAIFU_AUDIO_END_PROMPT_HZ, OPENWAIFU_AUDIO_END_PROMPT_MS);
         sg_capture_busy = false;
-        __rearm_detection();
     }
 }
 
 OPERATE_RET openwaifu_wakeup_init(void)
 {
     OPERATE_RET rt = OPRT_OK;
-    bool vad_inited = false;
-    bool kws_inited = false;
 
     TUYA_CALL_ERR_RETURN(tdl_audio_find(AUDIO_CODEC_NAME, &sg_audio_handle));
     TUYA_CALL_ERR_RETURN(tdl_audio_get_info(sg_audio_handle, &sg_audio_info));
@@ -564,13 +517,6 @@ OPERATE_RET openwaifu_wakeup_init(void)
               sg_audio_info.sample_rate, sg_audio_info.sample_bits,
               sg_audio_info.sample_ch_num, sg_audio_info.frame_size,
               OPENWAIFU_AUDIO_BUFFER_SIZE, OPENWAIFU_AUDIO_CHUNK_SIZE);
-
-    sg_vad_config.sample_rate       = sg_audio_info.sample_rate;
-    sg_vad_config.channel_num       = sg_audio_info.sample_ch_num;
-    sg_vad_config.speech_min_ms     = OPENWAIFU_VAD_SPEECH_MIN_MS;
-    sg_vad_config.noise_min_ms      = OPENWAIFU_VAD_NOISE_MIN_MS;
-    sg_vad_config.frame_duration_ms = 20;
-    sg_vad_config.scale             = 1.0f;
 
     TUYA_CALL_ERR_RETURN(tuya_ring_buff_create(OPENWAIFU_AUDIO_BUFFER_SIZE,
                                                 OVERFLOW_PSRAM_STOP_TYPE, &sg_audio_ring));
@@ -602,34 +548,6 @@ OPERATE_RET openwaifu_wakeup_init(void)
 
     TUYA_CALL_ERR_RETURN(tdl_audio_open(sg_audio_handle, __wakeup_audio_frame));
 
-    rt = tkl_vad_init(&sg_vad_config);
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
-    vad_inited = true;
-    tkl_vad_set_threshold(OPENWAIFU_VAD_THRESHOLD_LEVEL);
-
-    rt = tkl_kws_init();
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
-    kws_inited = true;
-
-    rt = tkl_kws_reg_wakeup_cb(__wakeup_word_detected);
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
-
-    rt = tkl_vad_start();
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
-
-    rt = tkl_kws_enable();
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
-
     TDL_BUTTON_CFG_T button_cfg = {
         .long_start_valid_time = 3000,
         .long_keep_timer = 1000,
@@ -645,25 +563,11 @@ OPERATE_RET openwaifu_wakeup_init(void)
     tdl_button_event_register(sg_button_handle, TDL_BUTTON_PRESS_SINGLE_CLICK,
                               __wakeup_button_event);
 
-    sg_wakeup_enabled = true;
-    PR_NOTICE("Local wake word ready: Ni Hao Tuya");
+    PR_NOTICE("Button-triggered audio capture ready");
     return OPRT_OK;
 
 init_failed:
-    sg_wakeup_enabled = false;
-    if (kws_inited) {
-        tkl_kws_disable();
-    }
-    if (vad_inited) {
-        tkl_vad_stop();
-        tkl_vad_deinit();
-    }
     tdl_audio_close(sg_audio_handle);
     sg_audio_handle = NULL;
     return rt;
-}
-
-BOOL_T openwaifu_wakeup_is_enabled(void)
-{
-    return sg_wakeup_enabled ? TRUE : FALSE;
 }
