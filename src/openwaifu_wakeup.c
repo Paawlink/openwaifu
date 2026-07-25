@@ -28,13 +28,6 @@
 #define OPENWAIFU_AUDIO_PROMPT_HZ       880
 #define OPENWAIFU_AUDIO_END_PROMPT_HZ   620
 #define OPENWAIFU_AUDIO_PROMPT_LEVEL    5000
-#define OPENWAIFU_WAKE_MONITOR_MS        2000
-#define OPENWAIFU_WAKE_IDLE_REARM_MS    30000
-#define OPENWAIFU_AUDIO_STALE_MS         3000
-/* Recreate AEC/VAD handles periodically: the RNN VAD keeps an adaptive noise
- * estimate that drifts in continuously noisy rooms until wake words are no
- * longer detected; only tkl_vad_deinit/init resets it (reboot-equivalent). */
-#define OPENWAIFU_WAKE_DEEP_RESET_MS (10 * 60 * 1000)
 /* -40 dB gate, the vendor-recommended level for noisy environments. */
 #define OPENWAIFU_VAD_THRESHOLD_LEVEL TKL_AUDIO_VAD_HIGH
 
@@ -64,11 +57,7 @@ static TUYA_RINGBUFF_T sg_audio_ring = NULL;
 static MUTEX_HANDLE sg_audio_mutex = NULL;
 static SEM_HANDLE sg_audio_sem = NULL;
 static THREAD_HANDLE sg_audio_thread = NULL;
-static THREAD_HANDLE sg_monitor_thread = NULL;
 static uint32_t sg_audio_dropped = 0;
-static volatile uint32_t sg_last_audio_frame_ms = 0;
-static volatile uint32_t sg_last_detection_reset_ms = 0;
-static volatile uint32_t sg_last_deep_reset_ms = 0;
 static TKL_VAD_CONFIG_T sg_vad_config = {0};
 static TUYA_RINGBUFF_T sg_tts_ring = NULL;
 static MUTEX_HANDLE sg_tts_mutex = NULL;
@@ -213,49 +202,14 @@ static void __play_prompt(uint16_t frequency, uint16_t duration_ms)
 static void __rearm_detection(void)
 {
     OPERATE_RET vad_stop_rt = tkl_vad_stop();
-    OPERATE_RET kws_rt = tkl_kws_enable();
     OPERATE_RET vad_start_rt = tkl_vad_start();
+    OPERATE_RET kws_rt = tkl_kws_enable();
 
     if (vad_stop_rt == OPRT_OK && vad_start_rt == OPRT_OK && kws_rt == OPRT_OK) {
-        sg_last_detection_reset_ms = (uint32_t)tal_system_get_millisecond();
         PR_NOTICE("Wake detection rearmed");
     } else {
         PR_ERR("Wake detection rearm failed: vad_stop=%d vad_start=%d kws=%d",
                vad_stop_rt, vad_start_rt, kws_rt);
-    }
-}
-
-static void __deep_reset_detection(void)
-{
-    OPERATE_RET vad_init_rt;
-    OPERATE_RET audio_stop_rt;
-    OPERATE_RET audio_start_rt;
-    uint32_t now;
-
-    tkl_kws_disable();
-    audio_stop_rt = tkl_ai_stop(0, 0);
-    tkl_vad_stop();
-    tkl_vad_deinit();
-    tal_system_sleep(50);
-
-    vad_init_rt = tkl_vad_init(&sg_vad_config);
-    if (vad_init_rt == OPRT_OK) {
-        tkl_vad_set_threshold(OPENWAIFU_VAD_THRESHOLD_LEVEL);
-        tkl_vad_start();
-    }
-    tkl_kws_enable();
-    audio_start_rt = tkl_ai_start(0, 0);
-
-    now = (uint32_t)tal_system_get_millisecond();
-    sg_last_audio_frame_ms = now;
-    sg_last_detection_reset_ms = now;
-    sg_last_deep_reset_ms = now;
-    if (vad_init_rt == OPRT_OK) {
-        PR_NOTICE("Wake detection deep reset done: audio stop=%d start=%d",
-                  audio_stop_rt, audio_start_rt);
-    } else {
-        PR_ERR("Wake detection deep reset: vad reinit failed rt=%d, retry in %u ms",
-               vad_init_rt, OPENWAIFU_WAKE_DEEP_RESET_MS);
     }
 }
 
@@ -418,8 +372,6 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
     (void)type;
     (void)status;
 
-    sg_last_audio_frame_ms = (uint32_t)tal_system_get_millisecond();
-
     /* T5AI sends the AEC/VAD output to KWS inside the audio driver pipeline. */
     if (!sg_recording || data == NULL || len == 0 || sg_audio_ring == NULL) {
         return;
@@ -443,57 +395,6 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
 
     if (written < len) {
         sg_audio_dropped += len - written;
-    }
-}
-
-static void __wakeup_monitor_task(void *arg)
-{
-    (void)arg;
-
-    while (1) {
-        uint32_t now;
-        uint32_t frame_age;
-        uint32_t reset_age;
-        uint32_t deep_reset_age;
-
-        tal_system_sleep(OPENWAIFU_WAKE_MONITOR_MS);
-        if (!sg_wakeup_enabled || sg_capture_busy || sg_recording || sg_record_requested ||
-            sg_tts_active) {
-            continue;
-        }
-
-        now = (uint32_t)tal_system_get_millisecond();
-        frame_age = now - sg_last_audio_frame_ms;
-        reset_age = now - sg_last_detection_reset_ms;
-        deep_reset_age = now - sg_last_deep_reset_ms;
-
-        if (frame_age >= OPENWAIFU_AUDIO_STALE_MS) {
-            OPERATE_RET audio_stop_rt;
-            OPERATE_RET audio_start_rt;
-
-            PR_WARN("Wake monitor: audio input stale for %u ms, restarting capture", frame_age);
-            audio_stop_rt = tkl_ai_stop(0, 0);
-            tal_system_sleep(50);
-            audio_start_rt = tkl_ai_start(0, 0);
-            sg_last_audio_frame_ms = now;
-            PR_NOTICE("Wake monitor: audio restart stop=%d start=%d",
-                      audio_stop_rt, audio_start_rt);
-            __rearm_detection();
-            continue;
-        }
-
-        if (deep_reset_age >= OPENWAIFU_WAKE_DEEP_RESET_MS) {
-            PR_NOTICE("Wake monitor: deep reset of AEC/VAD after %u ms, VAD=%u",
-                      deep_reset_age, tkl_vad_get_status());
-            __deep_reset_detection();
-        } else if (reset_age >= OPENWAIFU_WAKE_IDLE_REARM_MS) {
-            PR_NOTICE("Wake monitor: periodic detection refresh after %u ms, VAD=%u",
-                      reset_age, tkl_vad_get_status());
-            __rearm_detection();
-        } else {
-            PR_DEBUG("Wake monitor healthy: audio_age=%u ms reset_age=%u ms VAD=%u",
-                     frame_age, reset_age, tkl_vad_get_status());
-        }
     }
 }
 
@@ -711,21 +612,7 @@ OPERATE_RET openwaifu_wakeup_init(void)
         goto init_failed;
     }
 
-    sg_last_audio_frame_ms = (uint32_t)tal_system_get_millisecond();
-    sg_last_detection_reset_ms = sg_last_audio_frame_ms;
-    sg_last_deep_reset_ms = sg_last_audio_frame_ms;
     sg_wakeup_enabled = true;
-    THREAD_CFG_T monitor_thread_cfg = {
-        .priority = THREAD_PRIO_5,
-        .stackDepth = 3 * 1024,
-        .thrdname = "wake_monitor",
-        .psram_mode = 1,
-    };
-    rt = tal_thread_create_and_start(&sg_monitor_thread, NULL, NULL,
-                                     __wakeup_monitor_task, NULL, &monitor_thread_cfg);
-    if (rt != OPRT_OK) {
-        goto init_failed;
-    }
     PR_NOTICE("Local wake word ready: Ni Hao Tuya");
     return OPRT_OK;
 
