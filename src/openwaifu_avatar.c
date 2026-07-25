@@ -338,7 +338,7 @@ lv_obj_t *openwaifu_avatar_create(lv_obj_t *parent)
     /* animimg 继承自 image：去掉主题默认样式，仅按帧尺寸占位、居中显示。 */
     lv_obj_remove_style_all(sg_animimg);
     lv_obj_set_size(sg_animimg, AVATAR_FRAME_W, AVATAR_FRAME_H);
-    lv_obj_align(sg_animimg, LV_ALIGN_CENTER, 0, -12);
+    lv_obj_align(sg_animimg, LV_ALIGN_CENTER, 0, -6);
 
     /* 首次直接应用，无需淡入淡出 */
     sg_state           = OPENWAIFU_AVATAR_STATE_MAX; /* 强制首次应用 */

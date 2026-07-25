@@ -32,7 +32,7 @@ static MUTEX_HANDLE sg_msg_mutex     = NULL;  /* 保护下方共享消息状态 
 static MUTEX_HANDLE sg_notify_mutex  = NULL;  /* 串行化文本与音频 Notify */
 static bool         sg_ble_connected = false; /* 当前 BLE 连接状态 */
 static volatile bool sg_notify_enabled = false; /* 主机是否已订阅 Notify */
-static OPENWAIFU_BLE_SUBSCRIBE_CB sg_subscribe_cb = NULL; /* 订阅回调 */
+static OPENWAIFU_BLE_BINARY_CB sg_binary_cb = NULL;
 
 /* 命令行环形缓冲：BLE 任务写入尾部，UI 任务从头部取出（先进先出）。 */
 static char     sg_ring[OPENWAIFU_BLE_QUEUE_LEN][OPENWAIFU_BLE_MAX_MSG_LEN + 1];
@@ -202,13 +202,7 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
     }
 
     case TAL_BLE_EVT_SUBSCRIBE: {
-        bool subscribed = p_event->ble_event.subscribe.cur_notify ? true : false;
-
-        sg_notify_enabled = subscribed;
-        /* 主机刚订阅时回调一次，便于立即回传设备当前状态快照 */
-        if (subscribed && sg_subscribe_cb != NULL) {
-            sg_subscribe_cb();
-        }
+        sg_notify_enabled = p_event->ble_event.subscribe.cur_notify ? true : false;
         break;
     }
 
@@ -218,6 +212,13 @@ static void __ble_event_callback(TAL_BLE_EVT_PARAMS_T *p_event)
 
         if (report == NULL || report->p_data == NULL || report->len == 0) {
             PR_WARN("BLE write request with empty payload");
+            break;
+        }
+
+        if (report->len >= 3 && memcmp(report->p_data, "OWT", 3) == 0) {
+            if (sg_binary_cb != NULL) {
+                sg_binary_cb(report->p_data, report->len);
+            }
             break;
         }
 
@@ -240,23 +241,9 @@ BOOL_T openwaifu_ble_is_connected(void)
     return sg_ble_connected ? TRUE : FALSE;
 }
 
-void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb)
+void openwaifu_ble_set_binary_cb(OPENWAIFU_BLE_BINARY_CB cb)
 {
-    sg_subscribe_cb = cb;
-}
-
-OPERATE_RET openwaifu_ble_notify(const char *line)
-{
-    size_t         len;
-
-    if (line == NULL) {
-        return OPRT_INVALID_PARM;
-    }
-    len = strlen(line);
-    if (len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
-        return OPRT_INVALID_PARM;
-    }
-    return openwaifu_ble_notify_data((const uint8_t *)line, (uint16_t)len);
+    sg_binary_cb = cb;
 }
 
 OPERATE_RET openwaifu_ble_notify_data(const uint8_t *data, uint16_t len)

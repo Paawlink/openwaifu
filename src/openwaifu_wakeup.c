@@ -7,6 +7,7 @@
 #include "tuya_ringbuf.h"
 
 #include "tal_api.h"
+#include "tkl_audio.h"
 #include "tkl_kws.h"
 #include "tkl_vad.h"
 
@@ -20,15 +21,22 @@
 #define OPENWAIFU_VAD_NOISE_MIN_MS  300
 #define OPENWAIFU_AUDIO_BUFFER_SIZE  (96 * 1024)
 #define OPENWAIFU_AUDIO_CHUNK_SIZE   230
-#define OPENWAIFU_AUDIO_END_SILENCE_MS 350
-#define OPENWAIFU_AUDIO_MAX_RECORD_MS  10000
-#define OPENWAIFU_AUDIO_WAIT_SPEECH_MS 5000
+#define OPENWAIFU_AUDIO_RECORD_MS      5000
 #define OPENWAIFU_AUDIO_PROMPT_MS       120
 #define OPENWAIFU_AUDIO_END_PROMPT_MS   90
 #define OPENWAIFU_AUDIO_PROMPT_DELAY_MS 350
 #define OPENWAIFU_AUDIO_PROMPT_HZ       880
 #define OPENWAIFU_AUDIO_END_PROMPT_HZ   620
 #define OPENWAIFU_AUDIO_PROMPT_LEVEL    5000
+#define OPENWAIFU_WAKE_MONITOR_MS        2000
+#define OPENWAIFU_WAKE_IDLE_REARM_MS    30000
+#define OPENWAIFU_AUDIO_STALE_MS         3000
+/* Recreate AEC/VAD handles periodically: the RNN VAD keeps an adaptive noise
+ * estimate that drifts in continuously noisy rooms until wake words are no
+ * longer detected; only tkl_vad_deinit/init resets it (reboot-equivalent). */
+#define OPENWAIFU_WAKE_DEEP_RESET_MS (10 * 60 * 1000)
+/* -40 dB gate, the vendor-recommended level for noisy environments. */
+#define OPENWAIFU_VAD_THRESHOLD_LEVEL TKL_AUDIO_VAD_HIGH
 
 #define OPENWAIFU_AUDIO_MAGIC_0 'O'
 #define OPENWAIFU_AUDIO_MAGIC_1 'W'
@@ -36,6 +44,15 @@
 #define OPENWAIFU_AUDIO_PKT_START 1
 #define OPENWAIFU_AUDIO_PKT_DATA  2
 #define OPENWAIFU_AUDIO_PKT_END   3
+#define OPENWAIFU_TTS_MAGIC_0 'O'
+#define OPENWAIFU_TTS_MAGIC_1 'W'
+#define OPENWAIFU_TTS_MAGIC_2 'T'
+#define OPENWAIFU_TTS_PKT_START 1
+#define OPENWAIFU_TTS_PKT_DATA  2
+#define OPENWAIFU_TTS_PKT_END   3
+#define OPENWAIFU_TTS_BUFFER_SIZE (192 * 1024)
+#define OPENWAIFU_TTS_PREFILL_MS 500
+#define OPENWAIFU_TTS_PLAY_FRAME_MS 40
 
 static TDL_AUDIO_HANDLE_T sg_audio_handle = NULL;
 static volatile bool sg_wakeup_enabled = false;
@@ -47,7 +64,23 @@ static TUYA_RINGBUFF_T sg_audio_ring = NULL;
 static MUTEX_HANDLE sg_audio_mutex = NULL;
 static SEM_HANDLE sg_audio_sem = NULL;
 static THREAD_HANDLE sg_audio_thread = NULL;
+static THREAD_HANDLE sg_monitor_thread = NULL;
 static uint32_t sg_audio_dropped = 0;
+static volatile uint32_t sg_last_audio_frame_ms = 0;
+static volatile uint32_t sg_last_detection_reset_ms = 0;
+static volatile uint32_t sg_last_deep_reset_ms = 0;
+static TKL_VAD_CONFIG_T sg_vad_config = {0};
+static TUYA_RINGBUFF_T sg_tts_ring = NULL;
+static MUTEX_HANDLE sg_tts_mutex = NULL;
+static SEM_HANDLE sg_tts_sem = NULL;
+static THREAD_HANDLE sg_tts_thread = NULL;
+static volatile bool sg_tts_active = false;
+static volatile bool sg_tts_end_received = false;
+static uint32_t sg_tts_stream_id = 0;
+static uint32_t sg_tts_expected_bytes = 0;
+static uint32_t sg_tts_received_bytes = 0;
+static uint16_t sg_tts_next_sequence = 0;
+static bool sg_tts_playing = false;
 
 typedef enum {
     RECORD_STOP_SILENCE,
@@ -69,6 +102,17 @@ static void __put_u32_le(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)((value >> 8) & 0xFF);
     dst[2] = (uint8_t)((value >> 16) & 0xFF);
     dst[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static uint16_t __get_u16_le(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+static uint32_t __get_u32_le(const uint8_t *src)
+{
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) |
+           ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
 
 static OPERATE_RET __send_audio_start(uint32_t stream_id)
@@ -173,10 +217,196 @@ static void __rearm_detection(void)
     OPERATE_RET vad_start_rt = tkl_vad_start();
 
     if (vad_stop_rt == OPRT_OK && vad_start_rt == OPRT_OK && kws_rt == OPRT_OK) {
+        sg_last_detection_reset_ms = (uint32_t)tal_system_get_millisecond();
         PR_NOTICE("Wake detection rearmed");
     } else {
         PR_ERR("Wake detection rearm failed: vad_stop=%d vad_start=%d kws=%d",
                vad_stop_rt, vad_start_rt, kws_rt);
+    }
+}
+
+static void __deep_reset_detection(void)
+{
+    OPERATE_RET vad_init_rt;
+    OPERATE_RET audio_stop_rt;
+    OPERATE_RET audio_start_rt;
+    uint32_t now;
+
+    tkl_kws_disable();
+    audio_stop_rt = tkl_ai_stop(0, 0);
+    tkl_vad_stop();
+    tkl_vad_deinit();
+    tal_system_sleep(50);
+
+    vad_init_rt = tkl_vad_init(&sg_vad_config);
+    if (vad_init_rt == OPRT_OK) {
+        tkl_vad_set_threshold(OPENWAIFU_VAD_THRESHOLD_LEVEL);
+        tkl_vad_start();
+    }
+    tkl_kws_enable();
+    audio_start_rt = tkl_ai_start(0, 0);
+
+    now = (uint32_t)tal_system_get_millisecond();
+    sg_last_audio_frame_ms = now;
+    sg_last_detection_reset_ms = now;
+    sg_last_deep_reset_ms = now;
+    if (vad_init_rt == OPRT_OK) {
+        PR_NOTICE("Wake detection deep reset done: audio stop=%d start=%d",
+                  audio_stop_rt, audio_start_rt);
+    } else {
+        PR_ERR("Wake detection deep reset: vad reinit failed rt=%d, retry in %u ms",
+               vad_init_rt, OPENWAIFU_WAKE_DEEP_RESET_MS);
+    }
+}
+
+static void __tts_reset(void)
+{
+    tal_mutex_lock(sg_tts_mutex);
+    tuya_ring_buff_reset(sg_tts_ring);
+    tal_mutex_unlock(sg_tts_mutex);
+    sg_tts_active = false;
+    sg_tts_end_received = false;
+    sg_tts_expected_bytes = 0;
+    sg_tts_received_bytes = 0;
+    sg_tts_next_sequence = 0;
+    sg_tts_playing = false;
+}
+
+static void __tts_packet_received(const uint8_t *data, uint16_t len)
+{
+    uint8_t type;
+    uint32_t stream_id;
+
+    if (data == NULL || len < 4 || data[0] != OPENWAIFU_TTS_MAGIC_0 ||
+        data[1] != OPENWAIFU_TTS_MAGIC_1 || data[2] != OPENWAIFU_TTS_MAGIC_2) {
+        return;
+    }
+
+    type = data[3];
+    if (type == OPENWAIFU_TTS_PKT_START) {
+        if (len != 16 || sg_capture_busy || sg_recording) {
+            return;
+        }
+        uint16_t sample_rate = __get_u16_le(data + 12);
+        if (sample_rate != sg_audio_info.sample_rate || data[14] != sg_audio_info.sample_bits ||
+            data[15] != sg_audio_info.sample_ch_num) {
+            PR_ERR("TTS format mismatch: %u Hz/%u bit/%u ch", sample_rate, data[14], data[15]);
+            return;
+        }
+
+        __tts_reset();
+        sg_tts_stream_id = __get_u32_le(data + 4);
+        sg_tts_expected_bytes = __get_u32_le(data + 8);
+        sg_tts_active = true;
+        tkl_kws_disable();
+        PR_NOTICE("TTS stream %u started: %u bytes", sg_tts_stream_id, sg_tts_expected_bytes);
+        tal_semaphore_post(sg_tts_sem);
+        return;
+    }
+
+    if (!sg_tts_active || len < 8) {
+        return;
+    }
+    stream_id = __get_u32_le(data + 4);
+    if (stream_id != sg_tts_stream_id) {
+        return;
+    }
+
+    if (type == OPENWAIFU_TTS_PKT_DATA) {
+        uint16_t sequence;
+        uint16_t pcm_len;
+        uint32_t written = 0;
+
+        if (len <= 10) {
+            return;
+        }
+        sequence = __get_u16_le(data + 8);
+        pcm_len = len - 10;
+        if (sequence != sg_tts_next_sequence || pcm_len % __pcm_frame_bytes() != 0) {
+            PR_ERR("TTS stream packet error: expected=%u received=%u len=%u",
+                   sg_tts_next_sequence, sequence, pcm_len);
+            __tts_reset();
+            __rearm_detection();
+            return;
+        }
+
+        tal_mutex_lock(sg_tts_mutex);
+        if (tuya_ring_buff_free_size_get(sg_tts_ring) >= pcm_len) {
+            written = tuya_ring_buff_write(sg_tts_ring, data + 10, pcm_len);
+        }
+        tal_mutex_unlock(sg_tts_mutex);
+        if (written != pcm_len) {
+            PR_ERR("TTS ring buffer overflow");
+            __tts_reset();
+            __rearm_detection();
+            return;
+        }
+        sg_tts_received_bytes += written;
+        sg_tts_next_sequence++;
+        tal_semaphore_post(sg_tts_sem);
+    } else if (type == OPENWAIFU_TTS_PKT_END && len == 12) {
+        uint32_t declared_bytes = __get_u32_le(data + 8);
+        if (declared_bytes != sg_tts_expected_bytes || declared_bytes != sg_tts_received_bytes) {
+            PR_ERR("TTS stream size mismatch: expected=%u received=%u end=%u",
+                   sg_tts_expected_bytes, sg_tts_received_bytes, declared_bytes);
+            __tts_reset();
+            __rearm_detection();
+            return;
+        }
+        sg_tts_end_received = true;
+        tal_semaphore_post(sg_tts_sem);
+    }
+}
+
+static void __tts_play_task(void *arg)
+{
+    uint8_t frame[16000 * 2 * OPENWAIFU_TTS_PLAY_FRAME_MS / 1000];
+
+    (void)arg;
+    while (1) {
+        tal_semaphore_wait_forever(sg_tts_sem);
+        while (sg_tts_active) {
+            uint32_t used;
+            uint32_t read_len = 0;
+
+            tal_mutex_lock(sg_tts_mutex);
+            used = tuya_ring_buff_used_size_get(sg_tts_ring);
+            uint32_t prefill_bytes = (uint32_t)sg_audio_info.sample_rate *
+                                     sg_audio_info.sample_ch_num *
+                                     (sg_audio_info.sample_bits / 8) *
+                                     OPENWAIFU_TTS_PREFILL_MS / 1000;
+            if (!sg_tts_playing && (used >= prefill_bytes || sg_tts_end_received)) {
+                sg_tts_playing = true;
+                PR_NOTICE("TTS stream %u playback started with %u buffered bytes",
+                          sg_tts_stream_id, used);
+            }
+            if (sg_tts_playing && (used >= sizeof(frame) || sg_tts_end_received)) {
+                read_len = used > sizeof(frame) ? sizeof(frame) : used;
+                read_len -= read_len % __pcm_frame_bytes();
+                read_len = tuya_ring_buff_read(sg_tts_ring, frame, read_len);
+            }
+            tal_mutex_unlock(sg_tts_mutex);
+
+            if (read_len > 0) {
+                if (tdl_audio_play(sg_audio_handle, frame, read_len) != OPRT_OK) {
+                    PR_ERR("TTS speaker playback failed");
+                    __tts_reset();
+                    __rearm_detection();
+                    break;
+                }
+                tal_system_sleep(read_len * 1000 /
+                                 (sg_audio_info.sample_rate * sg_audio_info.sample_ch_num *
+                                  (sg_audio_info.sample_bits / 8)));
+            } else if (sg_tts_end_received) {
+                PR_NOTICE("TTS stream %u playback complete", sg_tts_stream_id);
+                __tts_reset();
+                tal_system_sleep(200);
+                __rearm_detection();
+                break;
+            } else {
+                tal_system_sleep(5);
+            }
+        }
     }
 }
 
@@ -187,6 +417,8 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
 
     (void)type;
     (void)status;
+
+    sg_last_audio_frame_ms = (uint32_t)tal_system_get_millisecond();
 
     /* T5AI sends the AEC/VAD output to KWS inside the audio driver pipeline. */
     if (!sg_recording || data == NULL || len == 0 || sg_audio_ring == NULL) {
@@ -211,6 +443,57 @@ static void __wakeup_audio_frame(TDL_AUDIO_FRAME_FORMAT_E type, TDL_AUDIO_STATUS
 
     if (written < len) {
         sg_audio_dropped += len - written;
+    }
+}
+
+static void __wakeup_monitor_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        uint32_t now;
+        uint32_t frame_age;
+        uint32_t reset_age;
+        uint32_t deep_reset_age;
+
+        tal_system_sleep(OPENWAIFU_WAKE_MONITOR_MS);
+        if (!sg_wakeup_enabled || sg_capture_busy || sg_recording || sg_record_requested ||
+            sg_tts_active) {
+            continue;
+        }
+
+        now = (uint32_t)tal_system_get_millisecond();
+        frame_age = now - sg_last_audio_frame_ms;
+        reset_age = now - sg_last_detection_reset_ms;
+        deep_reset_age = now - sg_last_deep_reset_ms;
+
+        if (frame_age >= OPENWAIFU_AUDIO_STALE_MS) {
+            OPERATE_RET audio_stop_rt;
+            OPERATE_RET audio_start_rt;
+
+            PR_WARN("Wake monitor: audio input stale for %u ms, restarting capture", frame_age);
+            audio_stop_rt = tkl_ai_stop(0, 0);
+            tal_system_sleep(50);
+            audio_start_rt = tkl_ai_start(0, 0);
+            sg_last_audio_frame_ms = now;
+            PR_NOTICE("Wake monitor: audio restart stop=%d start=%d",
+                      audio_stop_rt, audio_start_rt);
+            __rearm_detection();
+            continue;
+        }
+
+        if (deep_reset_age >= OPENWAIFU_WAKE_DEEP_RESET_MS) {
+            PR_NOTICE("Wake monitor: deep reset of AEC/VAD after %u ms, VAD=%u",
+                      deep_reset_age, tkl_vad_get_status());
+            __deep_reset_detection();
+        } else if (reset_age >= OPENWAIFU_WAKE_IDLE_REARM_MS) {
+            PR_NOTICE("Wake monitor: periodic detection refresh after %u ms, VAD=%u",
+                      reset_age, tkl_vad_get_status());
+            __rearm_detection();
+        } else {
+            PR_DEBUG("Wake monitor healthy: audio_age=%u ms reset_age=%u ms VAD=%u",
+                     frame_age, reset_age, tkl_vad_get_status());
+        }
     }
 }
 
@@ -297,10 +580,6 @@ static void __audio_stream_task(void *arg)
         uint16_t sequence = 0;
         uint32_t pcm_bytes = 0;
         uint32_t start_ms = (uint32_t)tal_system_get_millisecond();
-        uint32_t silence_start_ms = 0;
-        bool wake_phrase_ended = false;
-        bool user_speech_started = false;
-        bool last_speech = false;
         record_stop_reason_t stop_reason = RECORD_STOP_TIMEOUT;
 
         PR_NOTICE("Wake stream %u recording started: %u Hz/%u bit/%u ch",
@@ -309,32 +588,8 @@ static void __audio_stream_task(void *arg)
 
         while (sg_recording) {
             uint32_t now = (uint32_t)tal_system_get_millisecond();
-            bool speech = (tkl_vad_get_status() == TKL_VAD_STATUS_SPEECH);
 
-            if (speech != last_speech) {
-                PR_NOTICE("Wake stream %u VAD %s at %u ms", stream_id,
-                          speech ? "speech" : "silence", now - start_ms);
-                last_speech = speech;
-            }
-
-            if (!wake_phrase_ended) {
-                wake_phrase_ended = !speech;
-            } else if (!user_speech_started) {
-                user_speech_started = speech;
-                if (!user_speech_started && now - start_ms >= OPENWAIFU_AUDIO_WAIT_SPEECH_MS) {
-                    stop_reason = RECORD_STOP_NO_SPEECH;
-                    sg_recording = false;
-                }
-            } else if (speech) {
-                silence_start_ms = 0;
-            } else if (silence_start_ms == 0) {
-                silence_start_ms = now;
-            } else if (now - silence_start_ms >= OPENWAIFU_AUDIO_END_SILENCE_MS) {
-                stop_reason = RECORD_STOP_SILENCE;
-                sg_recording = false;
-            }
-
-            if (now - start_ms >= OPENWAIFU_AUDIO_MAX_RECORD_MS) {
+            if (now - start_ms >= OPENWAIFU_AUDIO_RECORD_MS) {
                 stop_reason = RECORD_STOP_TIMEOUT;
                 sg_recording = false;
             } else if (!openwaifu_ble_is_connected()) {
@@ -383,7 +638,6 @@ OPERATE_RET openwaifu_wakeup_init(void)
     OPERATE_RET rt = OPRT_OK;
     bool vad_inited = false;
     bool kws_inited = false;
-    TKL_VAD_CONFIG_T vad_config = {0};
 
     TUYA_CALL_ERR_RETURN(tdl_audio_find(AUDIO_CODEC_NAME, &sg_audio_handle));
     TUYA_CALL_ERR_RETURN(tdl_audio_get_info(sg_audio_handle, &sg_audio_info));
@@ -392,17 +646,21 @@ OPERATE_RET openwaifu_wakeup_init(void)
               sg_audio_info.sample_ch_num, sg_audio_info.frame_size,
               OPENWAIFU_AUDIO_BUFFER_SIZE, OPENWAIFU_AUDIO_CHUNK_SIZE);
 
-    vad_config.sample_rate       = sg_audio_info.sample_rate;
-    vad_config.channel_num       = sg_audio_info.sample_ch_num;
-    vad_config.speech_min_ms     = OPENWAIFU_VAD_SPEECH_MIN_MS;
-    vad_config.noise_min_ms      = OPENWAIFU_VAD_NOISE_MIN_MS;
-    vad_config.frame_duration_ms = 20;
-    vad_config.scale             = 1.0f;
+    sg_vad_config.sample_rate       = sg_audio_info.sample_rate;
+    sg_vad_config.channel_num       = sg_audio_info.sample_ch_num;
+    sg_vad_config.speech_min_ms     = OPENWAIFU_VAD_SPEECH_MIN_MS;
+    sg_vad_config.noise_min_ms      = OPENWAIFU_VAD_NOISE_MIN_MS;
+    sg_vad_config.frame_duration_ms = 20;
+    sg_vad_config.scale             = 1.0f;
 
     TUYA_CALL_ERR_RETURN(tuya_ring_buff_create(OPENWAIFU_AUDIO_BUFFER_SIZE,
                                                 OVERFLOW_PSRAM_STOP_TYPE, &sg_audio_ring));
     TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_audio_mutex));
     TUYA_CALL_ERR_RETURN(tal_semaphore_create_init(&sg_audio_sem, 0, 64));
+    TUYA_CALL_ERR_RETURN(tuya_ring_buff_create(OPENWAIFU_TTS_BUFFER_SIZE,
+                                                OVERFLOW_PSRAM_STOP_TYPE, &sg_tts_ring));
+    TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_tts_mutex));
+    TUYA_CALL_ERR_RETURN(tal_semaphore_create_init(&sg_tts_sem, 0, 64));
 
     THREAD_CFG_T thread_cfg = {
         .priority = THREAD_PRIO_4,
@@ -413,13 +671,24 @@ OPERATE_RET openwaifu_wakeup_init(void)
     TUYA_CALL_ERR_RETURN(tal_thread_create_and_start(&sg_audio_thread, NULL, NULL,
                                                       __audio_stream_task, NULL, &thread_cfg));
 
+    THREAD_CFG_T tts_thread_cfg = {
+        .priority = THREAD_PRIO_4,
+        .stackDepth = 3 * 1024,
+        .thrdname = "tts_play",
+        .psram_mode = 1,
+    };
+    TUYA_CALL_ERR_RETURN(tal_thread_create_and_start(&sg_tts_thread, NULL, NULL,
+                                                      __tts_play_task, NULL, &tts_thread_cfg));
+    openwaifu_ble_set_binary_cb(__tts_packet_received);
+
     TUYA_CALL_ERR_RETURN(tdl_audio_open(sg_audio_handle, __wakeup_audio_frame));
 
-    rt = tkl_vad_init(&vad_config);
+    rt = tkl_vad_init(&sg_vad_config);
     if (rt != OPRT_OK) {
         goto init_failed;
     }
     vad_inited = true;
+    tkl_vad_set_threshold(OPENWAIFU_VAD_THRESHOLD_LEVEL);
 
     rt = tkl_kws_init();
     if (rt != OPRT_OK) {
@@ -442,7 +711,21 @@ OPERATE_RET openwaifu_wakeup_init(void)
         goto init_failed;
     }
 
+    sg_last_audio_frame_ms = (uint32_t)tal_system_get_millisecond();
+    sg_last_detection_reset_ms = sg_last_audio_frame_ms;
+    sg_last_deep_reset_ms = sg_last_audio_frame_ms;
     sg_wakeup_enabled = true;
+    THREAD_CFG_T monitor_thread_cfg = {
+        .priority = THREAD_PRIO_5,
+        .stackDepth = 3 * 1024,
+        .thrdname = "wake_monitor",
+        .psram_mode = 1,
+    };
+    rt = tal_thread_create_and_start(&sg_monitor_thread, NULL, NULL,
+                                     __wakeup_monitor_task, NULL, &monitor_thread_cfg);
+    if (rt != OPRT_OK) {
+        goto init_failed;
+    }
     PR_NOTICE("Local wake word ready: Ni Hao Tuya");
     return OPRT_OK;
 

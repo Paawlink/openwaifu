@@ -22,8 +22,6 @@
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
  *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/X=Confused/D=Done）
- *   W|<ssid>|<pass>                    WiFi 配网（百分号编码的凭据，交给 openwaifu_wifi 模块）
- *   F                                  忘记网络（断开 WiFi 并清除已保存的凭据）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
  * <ev> 为单字符事件码：E=出错 X=取消 D=完成（驱动桌宠事件形象）。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
@@ -42,13 +40,13 @@
 #include "openwaifu_ble.h"
 #include "openwaifu_font.h"
 #include "openwaifu_wakeup.h"
-#include "openwaifu_wifi.h"
 
 /* 右栏会话列表的插件图标资源（27x27 内嵌 PNG，见 src/assets/icon_*.c）。 */
 LV_IMAGE_DECLARE(icon_claude);   /* claudecode */
 LV_IMAGE_DECLARE(icon_openai);   /* codex */
 LV_IMAGE_DECLARE(icon_opencode); /* opencode */
 LV_IMAGE_DECLARE(icon_qoder);    /* qoder */
+LV_IMAGE_DECLARE(icon_tools);    /* tools */
 
 /***********************************************************
  *************************宏定义****************************
@@ -89,8 +87,8 @@ LV_IMAGE_DECLARE(icon_qoder);    /* qoder */
 #define COL_ICON_OPEN   0x3B82C4 /* opencode（蓝） */
 #define COL_ICON_AGENT  0xC9B29A /* 默认 / agent（米色） */
 
-#define UNKNOWN_SESSION_TITLE  "Applying patches to codespace"
-#define UNKNOWN_SESSION_PLUGIN "claudecode"
+#define UNKNOWN_SESSION_TITLE  "Applying patches"
+#define UNKNOWN_SESSION_PLUGIN "tools"
 
 /***********************************************************
  ***********************类型定义****************************
@@ -155,9 +153,7 @@ static lv_obj_t    *sg_legend          = NULL; /* 底部图例卡片（按连接
 static bool         sg_conn_last       = false; /* 上次已展示的蓝牙连接状态 */
 static bool         sg_structure_dirty = true; /* 会话增删时需协调列表 */
 static lv_obj_t    *sg_empty_hint      = NULL; /* 空状态提示标签（避免每次刷新重建） */
-static lv_obj_t    *sg_wifi_icon       = NULL; /* 左栏人物框右上角的 WiFi 已连接图标 */
-static bool         sg_wifi_last       = false; /* 上次已展示的 WiFi 连接状态 */
-static lv_obj_t    *sg_mic_icon        = NULL; /* WiFi 左侧的本地关键词监听图标 */
+static lv_obj_t    *sg_mic_icon        = NULL; /* 左栏人物框右上角的本地关键词监听图标 */
 static bool         sg_mic_last        = false; /* 上次已展示的关键词监听状态 */
 
 /* 详情页状态 */
@@ -291,6 +287,9 @@ static const lv_image_dsc_t *__plugin_icon_src(const char *plugin)
     }
     if (strcmp(plugin, "qoder") == 0) {
         return &icon_qoder;
+    }
+    if (strcmp(plugin, "tools") == 0) {
+        return &icon_tools;
     }
     return NULL;
 }
@@ -590,25 +589,6 @@ static void __ui_handle_line(char *line)
         return;
     }
 
-    if (cmd == 'W' && line[1] == '|') {
-        /* W|<ssid>|<pass> —— 百分号编码的 WiFi 凭据，解码由 wifi 模块完成。 */
-        char *ssid = line + 2;
-        char *sep  = strchr(ssid, '|');
-
-        if (sep == NULL) {
-            return; /* 缺少密码字段，视为非法命令 */
-        }
-        *sep = '\0';
-        openwaifu_wifi_provision(ssid, sep + 1);
-        return;
-    }
-
-    if (cmd == 'F' && line[1] == '\0') {
-        /* 忘记网络：断开 WiFi 并清除已保存的凭据。 */
-        openwaifu_wifi_forget();
-        return;
-    }
-
     if (cmd == 'S' && line[1] == '|') {
         /* S|sid|st|elapsed|plugin|task —— 去掉 "S|" 后按 4 个分隔符切出 5 段 */
         char *fields[5];
@@ -835,19 +815,11 @@ static void __build_avatar(lv_obj_t *parent)
     /* 虚拟形象动画：由 openwaifu_avatar 模块管理帧序列，后续可按状态切换序列。 */
     openwaifu_avatar_create(avatar);
 
-    /* 右上角 WiFi 已连接图标：默认隐藏，由刷新定时器按连接状态切换显隐。
+    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。
      * 后于形象动画创建，保证图标始终浮在动画上层。 */
-    sg_wifi_icon = lv_label_create(avatar);
-    lv_label_set_text(sg_wifi_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(sg_wifi_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sg_wifi_icon, lv_color_hex(COL_DONE), 0);
-    lv_obj_align(sg_wifi_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
-
-    /* 本地唤醒监听图标：用基础图形绘制，避免依赖字体中未包含的麦克风符号。 */
     sg_mic_icon = __make_plain(avatar);
     lv_obj_set_size(sg_mic_icon, 16, 16);
-    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, -22, 0);
+    lv_obj_align(sg_mic_icon, LV_ALIGN_TOP_RIGHT, 0, 0);
     lv_obj_add_flag(sg_mic_icon, LV_OBJ_FLAG_HIDDEN);
 
     mic_body = lv_obj_create(sg_mic_icon);
@@ -1454,21 +1426,7 @@ static void __ui_refresh_cb(lv_timer_t *timer)
         __rebuild_legend();
     }
 
-    /* WiFi 连接状态变化时切换人物框右上角的 WiFi 图标显隐。 */
-    if (sg_wifi_icon != NULL) {
-        bool wifi_on = openwaifu_wifi_is_connected() ? true : false;
-
-        if (wifi_on != sg_wifi_last) {
-            sg_wifi_last = wifi_on;
-            if (wifi_on) {
-                lv_obj_clear_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(sg_wifi_icon, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-    }
-
-    /* 端侧关键词唤醒成功运行时，在 WiFi 左侧显示麦克风图标。 */
+    /* 端侧关键词唤醒成功运行时，在人物框右上角显示麦克风图标。 */
     if (sg_mic_icon != NULL) {
         bool mic_on = openwaifu_wakeup_is_enabled() ? true : false;
 
