@@ -40,6 +40,8 @@
 #define OPENWAIFU_TTS_BUFFER_SIZE (192 * 1024)
 #define OPENWAIFU_TTS_PREFILL_MS 500
 #define OPENWAIFU_TTS_PLAY_FRAME_MS 40
+/* 录音结束后等待 TTS 回复的超时：超时后语音阶段回落到 IDLE，避免 UI 长期停在等待形象。 */
+#define OPENWAIFU_VOICE_WAIT_TIMEOUT_MS 30000
 
 static TDL_AUDIO_HANDLE_T sg_audio_handle = NULL;
 static volatile bool sg_record_requested = false;
@@ -63,6 +65,8 @@ static uint32_t sg_tts_expected_bytes = 0;
 static uint32_t sg_tts_received_bytes = 0;
 static uint16_t sg_tts_next_sequence = 0;
 static bool sg_tts_playing = false;
+static volatile openwaifu_voice_phase_t sg_voice_phase = OPENWAIFU_VOICE_IDLE;
+static volatile uint32_t sg_voice_wait_start_ms = 0;
 
 typedef enum {
     RECORD_STOP_SILENCE,
@@ -220,6 +224,8 @@ static void __tts_packet_received(const uint8_t *data, uint16_t len)
         if (len != 16 || sg_capture_busy || sg_recording) {
             return;
         }
+        /* TTS 内容已返回：无论后续格式校验是否通过，语音交互的等待阶段均已结束。 */
+        sg_voice_phase = OPENWAIFU_VOICE_IDLE;
         uint16_t sample_rate = __get_u16_le(data + 12);
         if (sample_rate != sg_audio_info.sample_rate || data[14] != sg_audio_info.sample_bits ||
             data[15] != sg_audio_info.sample_ch_num) {
@@ -376,6 +382,7 @@ static void __request_wakeup_capture(const char *source)
         openwaifu_ble_is_connected()) {
         sg_capture_busy = true;
         sg_record_requested = true;
+        sg_voice_phase = OPENWAIFU_VOICE_CAPTURING;
         PR_NOTICE("Audio capture queued by %s", source);
         tal_semaphore_post(sg_audio_sem);
     } else {
@@ -426,6 +433,7 @@ static void __audio_stream_task(void *arg)
 
         sg_record_requested = false;
         if (!openwaifu_ble_is_connected()) {
+            sg_voice_phase = OPENWAIFU_VOICE_IDLE;
             sg_capture_busy = false;
             continue;
         }
@@ -435,6 +443,7 @@ static void __audio_stream_task(void *arg)
                   OPENWAIFU_AUDIO_PROMPT_DELAY_MS);
         tal_system_sleep(OPENWAIFU_AUDIO_PROMPT_DELAY_MS);
         if (!openwaifu_ble_is_connected()) {
+            sg_voice_phase = OPENWAIFU_VOICE_IDLE;
             sg_capture_busy = false;
             continue;
         }
@@ -442,6 +451,7 @@ static void __audio_stream_task(void *arg)
         stream_id++;
         if (__send_audio_start(stream_id) != OPRT_OK) {
             PR_ERR("Wake stream %u start notification failed", stream_id);
+            sg_voice_phase = OPENWAIFU_VOICE_IDLE;
             sg_capture_busy = false;
             continue;
         }
@@ -503,8 +513,27 @@ static void __audio_stream_task(void *arg)
                   (uint32_t)tal_system_get_millisecond() - start_ms,
                   sequence, pcm_bytes, sg_audio_dropped);
         __play_prompt(OPENWAIFU_AUDIO_END_PROMPT_HZ, OPENWAIFU_AUDIO_END_PROMPT_MS);
+        /* 录音正常结束且链路仍在：进入等待 TTS 回复阶段；否则直接回落 IDLE。 */
+        if (stop_reason == RECORD_STOP_TIMEOUT && openwaifu_ble_is_connected()) {
+            sg_voice_wait_start_ms = (uint32_t)tal_system_get_millisecond();
+            sg_voice_phase = OPENWAIFU_VOICE_WAITING;
+        } else {
+            sg_voice_phase = OPENWAIFU_VOICE_IDLE;
+        }
         sg_capture_busy = false;
     }
+}
+
+openwaifu_voice_phase_t openwaifu_wakeup_voice_phase(void)
+{
+    if (sg_voice_phase == OPENWAIFU_VOICE_WAITING) {
+        uint32_t now = (uint32_t)tal_system_get_millisecond();
+        if (now - sg_voice_wait_start_ms >= OPENWAIFU_VOICE_WAIT_TIMEOUT_MS) {
+            PR_WARN("Voice reply wait timed out after %u ms", OPENWAIFU_VOICE_WAIT_TIMEOUT_MS);
+            sg_voice_phase = OPENWAIFU_VOICE_IDLE;
+        }
+    }
+    return sg_voice_phase;
 }
 
 OPERATE_RET openwaifu_wakeup_init(void)

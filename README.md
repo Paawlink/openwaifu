@@ -33,29 +33,73 @@ OpenWaifu 是一个基于 TuyaOpen SDK 和 LVGL 9 的示例应用，运行在 T5
 UI 模块通过 BLE 模块暴露的接口（`openwaifu_ble_is_connected` / `openwaifu_ble_fetch_message`）
 单向拉取连接状态与新命令行，解析为会话看板的增/删/改，两个模块之间不直接依赖 LVGL 与 BLE 协议栈细节。
 
-## 固件构建
+## 部署（构建与烧录）
+
+### 环境要求
+
+- 已克隆 [TuyaOpen](https://github.com/tuya/TuyaOpen) 仓库（本应用位于 `apps/openwaifu`）
+- Python 3（`export.sh` 首次运行会自动创建 `.venv` 并安装 SDK 工具链，需要网络）
+- 硬件：T5AI 开发板（TUYA_T5AI_BOARD，3.5 寸 LCD）+ USB 串口线
+
+### 1. 初始化环境
 
 ```bash
-# 在仓库根目录初始化环境
+# 在 TuyaOpen 仓库根目录执行（每个新 shell 会话都需要 source 一次）
+cd TuyaOpen
 . ./export.sh
 
-# 注意选择正确的型号和lcd配置文件
-cd apps/openwaifu
-tos.py config choice
-tos.py config menu
+# 可选：检查工具链与子模块是否就绪
+tos.py check
+```
 
-# 构建 openwaifu（T5AI）
+### 2. 选择板型配置
+
+```bash
+cd apps/openwaifu
+
+# 交互式选择配置文件，选 config/TUYA_T5AI_BOARD_LCD_3.5.config
+tos.py config choice
+
+# 可选：需要微调配置项时再进菜单
+tos.py config menu
+```
+
+默认的 `app_default.config` 面向 TUYA_T5AI_BOARD；带 3.5 寸 LCD 的板子请务必选择 `TUYA_T5AI_BOARD_LCD_3.5.config`，否则屏幕无显示。
+
+### 3. 构建
+
+```bash
 tos.py build
 ```
 
-构建产物位于 `apps/openwaifu/dist/`。
+首次构建会拉取 T5AI 平台 SDK，耗时较长；构建产物位于 `apps/openwaifu/dist/`（含 QIO 全量固件与 OTA 包）。
 
-## 固件烧录
+### 4. 烧录
 
 ```bash
-
+# 接上 USB 串口线后烧录（不指定 -p 时会引导选择串口）
 tos.py flash
+
+# 指定串口与波特率（macOS 串口一般为 /dev/cu.usbserial-*）
+tos.py flash -p /dev/cu.usbserial-XXXX -b 921600
 ```
+
+烧录卡在等待设备时，按一下板上的复位（RST）键让设备进入下载模式。
+
+### 5. 验证
+
+```bash
+# 查看设备日志（退出：Ctrl-C）
+tos.py monitor -p /dev/cu.usbserial-XXXX
+```
+
+烧录成功后设备会：
+
+1. 屏幕显示会话看板，左栏为桌宠形象，底部图例显示「请连接蓝牙」；
+2. 以 `OpenWaifu` 名称开始 BLE 广播；
+3. 电脑端启动 OpenWaifuD 后自动被连接，图例切换为状态说明，即部署完成。
+
+后续部署顺序：先烧录本固件 → 再运行电脑端守护进程 OpenWaifuD → 最后接入 Agent 桥接（见各自仓库 README）。
 
 ## 配置说明
 

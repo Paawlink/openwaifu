@@ -21,7 +21,7 @@
  *   S|<sid>|<st>|<elapsed>|<plugin>|<task>  新增或更新某会话
  *   B                                  快照同步开始（把现有会话标记为“未见”）
  *   E                                  快照同步结束（移除本轮未再出现的会话）
- *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/X=Confused/D=Done）
+ *   G|<ev>|<detail>                    全局事件（驱动虚拟形象事件状态：E=Error/D=Done，X=取消仅记录不换形象）
  * 其中 <st> 为单字符状态码：T=思考 C=编码 V=测试 E=出错 I=空闲(完成)。
  * <ev> 为单字符事件码：E=出错 X=取消 D=完成（驱动桌宠事件形象）。
  * B/E 用于周期性快照对账，使屏幕列表无闪烁地收敛到与守护进程状态完全一致。
@@ -39,6 +39,7 @@
 #include "openwaifu_avatar.h"
 #include "openwaifu_ble.h"
 #include "openwaifu_font.h"
+#include "openwaifu_wakeup.h"
 
 /* 右栏会话列表的插件图标资源（27x27 内嵌 PNG，见 src/assets/icon_*.c）。 */
 LV_IMAGE_DECLARE(icon_claude);   /* claudecode */
@@ -172,12 +173,15 @@ static uint32_t     sg_detail_displayed_elapsed = (uint32_t)-1;
 /* ── 虚拟形象状态机 ───────────────────────────────────── */
 
 /**
- * 桌宠形象分为三层：
- * 1. 基础状态：由当前会话列表决定——无活跃任务时为 IDLE（Moyu / Sleep 随机），
- *    有活跃任务时为 WORKING（Thinking / Coding / Cycling 随机）。
- * 2. 事件状态：错误 / 用户取消 / 任务完成等事件触发，临时展示对应形象约 5 秒，
+ * 桌宠形象分为四层（优先级由高到低）：
+ * 1. 语音交互层：按键触发录音时展示 Confused，录音结束后进入等待阶段展示
+ *    Thinking，直到 TTS 内容返回（或等待超时）才回落到下层状态。
+ *    Thinking / Confused 专用于语音交互，不再参与工作随机池与取消事件。
+ * 2. 事件状态：错误 / 任务完成等事件触发，临时展示对应形象约 5 秒，
  *    然后自动回落到基础状态。
- * 3. 随机重摇：基础状态下每隔约 15 秒随机重新选择一个形象，避免长期固定不变，
+ * 3. 基础状态：由当前会话列表决定——无活跃任务时为 IDLE（Moyu / Sleep 随机），
+ *    有活跃任务时为 WORKING（Coding / Cycling 随机，不含 Thinking）。
+ * 4. 随机重摇：基础状态下每隔约 15 秒随机重新选择一个形象，避免长期固定不变，
  *    但不会切换太快以防止分散注意力。
  */
 typedef enum {
@@ -193,6 +197,7 @@ static bool          sg_avatar_event_active  = false;       /* 正在展示事�
 static openwaifu_avatar_state_t sg_avatar_event_state;      /* 当前事件形象，用于事件优先级 */
 static lv_timer_t   *sg_avatar_event_timer   = NULL;        /* 事件超时定时器 */
 static lv_timer_t   *sg_avatar_reroll_timer  = NULL;        /* 随机重摇定时器 */
+static openwaifu_voice_phase_t sg_avatar_voice_phase = OPENWAIFU_VOICE_IDLE; /* 已应用的语音阶段 */
 
 /***********************************************************
  ***********************工具函数****************************
@@ -571,13 +576,11 @@ static void __ui_handle_line(char *line)
         if (ev == 'E') {
             /* 错误事件 -> Error 形象 */
             __avatar_trigger_event(OPENWAIFU_AVATAR_ERROR);
-        } else if (ev == 'X') {
-            /* 用户取消事件 -> Confused 形象 */
-            __avatar_trigger_event(OPENWAIFU_AVATAR_CONFUSED);
         } else if (ev == 'D') {
             /* 任务完成事件 -> Celebration 形象 */
             __avatar_trigger_event(OPENWAIFU_AVATAR_CELEBRATION);
         }
+        /* X（用户取消）不再切换形象：Confused 专用于语音录音阶段。 */
         return;
     }
 
@@ -1251,14 +1254,10 @@ static openwaifu_avatar_state_t __avatar_pick_idle(void)
     return (rand() % 2 == 0) ? OPENWAIFU_AVATAR_MOYU : OPENWAIFU_AVATAR_SLEEP;
 }
 
-/** 随机选择一个工作形象：Thinking、Coding 或 Cycling。 */
+/** 随机选择一个工作形象：Coding 或 Cycling（Thinking 专用于语音等待阶段）。 */
 static openwaifu_avatar_state_t __avatar_pick_working(void)
 {
-    switch (rand() % 3) {
-    case 0:  return OPENWAIFU_AVATAR_THINKING;
-    case 1:  return OPENWAIFU_AVATAR_CODING;
-    default: return OPENWAIFU_AVATAR_CYCLING;
-    }
+    return (rand() % 2 == 0) ? OPENWAIFU_AVATAR_CODING : OPENWAIFU_AVATAR_CYCLING;
 }
 
 /** 根据当前基础状态随机选择形象。 */
@@ -1277,17 +1276,23 @@ static void __avatar_event_timer_cb(lv_timer_t *timer)
         lv_timer_delete(sg_avatar_event_timer);
         sg_avatar_event_timer = NULL;
     }
-    /* 回落到基础状态形象 */
-    openwaifu_avatar_set_state(__avatar_pick_base());
+    /* 语音交互展示中不回落，等语音阶段结束后统一恢复 */
+    if (sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
+        openwaifu_avatar_set_state(__avatar_pick_base());
+    }
 }
 
-/** 触发一个事件形象（Error / Confused / Celebration），展示约 5 秒后自动回落。 */
+/** 触发一个事件形象（Error / Celebration），展示约 5 秒后自动回落。 */
 static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 {
-    /* 失败/取消事件展示期间忽略迟到的完成事件，避免 Celebration 覆盖真实结果。 */
+    /* 语音交互展示中优先级更高，丢弃期间到达的事件形象。 */
+    if (sg_avatar_voice_phase != OPENWAIFU_VOICE_IDLE) {
+        return;
+    }
+
+    /* 失败事件展示期间忽略迟到的完成事件，避免 Celebration 覆盖真实结果。 */
     if (state == OPENWAIFU_AVATAR_CELEBRATION && sg_avatar_event_active &&
-        (sg_avatar_event_state == OPENWAIFU_AVATAR_ERROR ||
-         sg_avatar_event_state == OPENWAIFU_AVATAR_CONFUSED)) {
+        sg_avatar_event_state == OPENWAIFU_AVATAR_ERROR) {
         return;
     }
 
@@ -1308,10 +1313,39 @@ static void __avatar_trigger_event(openwaifu_avatar_state_t state)
 static void __avatar_reroll_cb(lv_timer_t *timer)
 {
     (void)timer;
-    /* 事件展示中不重摇，等事件结束后自然会回落 */
-    if (!sg_avatar_event_active) {
+    /* 语音交互 / 事件展示中不重摇，结束后自然会回落 */
+    if (!sg_avatar_event_active && sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
         openwaifu_avatar_state_t pick = __avatar_pick_base();
         openwaifu_avatar_set_state(pick);
+    }
+}
+
+/**
+ * 轮询语音交互阶段并驱动对应形象（优先级最高）：
+ * 录音中 -> Confused；等待 TTS 回复 -> Thinking；
+ * 回到 IDLE（TTS 返回或超时）时恢复事件形象或基础形象。
+ */
+static void __avatar_poll_voice(void)
+{
+    openwaifu_voice_phase_t phase = openwaifu_wakeup_voice_phase();
+
+    if (phase == sg_avatar_voice_phase) {
+        return;
+    }
+    sg_avatar_voice_phase = phase;
+
+    switch (phase) {
+    case OPENWAIFU_VOICE_CAPTURING:
+        openwaifu_avatar_set_state(OPENWAIFU_AVATAR_CONFUSED);
+        break;
+    case OPENWAIFU_VOICE_WAITING:
+        openwaifu_avatar_set_state(OPENWAIFU_AVATAR_THINKING);
+        break;
+    default:
+        /* 语音交互结束：若事件形象仍在展示期内则恢复事件形象，否则回落基础形象 */
+        openwaifu_avatar_set_state(sg_avatar_event_active ? sg_avatar_event_state
+                                                          : __avatar_pick_base());
+        break;
     }
 }
 
@@ -1336,8 +1370,8 @@ static void __avatar_update_base(void)
     new_base = has_active ? AVATAR_BASE_WORKING : AVATAR_BASE_IDLE;
     if (new_base != sg_avatar_base) {
         sg_avatar_base = new_base;
-        /* 基础状态变化时立即应用新形象（事件展示中则等结束后自动回落） */
-        if (!sg_avatar_event_active) {
+        /* 基础状态变化时立即应用新形象（语音/事件展示中则等结束后自动回落） */
+        if (!sg_avatar_event_active && sg_avatar_voice_phase == OPENWAIFU_VOICE_IDLE) {
             openwaifu_avatar_set_state(__avatar_pick_base());
         }
     }
@@ -1385,6 +1419,9 @@ static void __ui_refresh_cb(lv_timer_t *timer)
 
     /* 更新虚拟形象基础状态（IDLE / WORKING） */
     __avatar_update_base();
+
+    /* 轮询语音交互阶段（录音 Confused / 等待回复 Thinking） */
+    __avatar_poll_voice();
 }
 
 /***********************************************************
