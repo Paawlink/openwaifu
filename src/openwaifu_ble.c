@@ -29,6 +29,7 @@
  ***********************变量定义****************************
  ***********************************************************/
 static MUTEX_HANDLE sg_msg_mutex     = NULL;  /* 保护下方共享消息状态 */
+static MUTEX_HANDLE sg_notify_mutex  = NULL;  /* 串行化文本与音频 Notify */
 static bool         sg_ble_connected = false; /* 当前 BLE 连接状态 */
 static volatile bool sg_notify_enabled = false; /* 主机是否已订阅 Notify */
 static OPENWAIFU_BLE_SUBSCRIBE_CB sg_subscribe_cb = NULL; /* 订阅回调 */
@@ -246,7 +247,6 @@ void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb)
 
 OPERATE_RET openwaifu_ble_notify(const char *line)
 {
-    TAL_BLE_DATA_T data;
     size_t         len;
 
     if (line == NULL) {
@@ -256,13 +256,28 @@ OPERATE_RET openwaifu_ble_notify(const char *line)
     if (len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
         return OPRT_INVALID_PARM;
     }
-    if (!sg_ble_connected || !sg_notify_enabled) {
+    return openwaifu_ble_notify_data((const uint8_t *)line, (uint16_t)len);
+}
+
+OPERATE_RET openwaifu_ble_notify_data(const uint8_t *data, uint16_t len)
+{
+    OPERATE_RET rt;
+    TAL_BLE_DATA_T packet;
+
+    if (data == NULL || len == 0 || len > OPENWAIFU_BLE_MAX_MSG_LEN) {
+        return OPRT_INVALID_PARM;
+    }
+    if (!sg_ble_connected || !sg_notify_enabled || sg_notify_mutex == NULL) {
         return OPRT_COM_ERROR;
     }
 
-    data.len    = (uint16_t)len;
-    data.p_data = (uint8_t *)line;
-    return tal_ble_server_common_send(&data);
+    packet.len    = len;
+    packet.p_data = (uint8_t *)data;
+
+    tal_mutex_lock(sg_notify_mutex);
+    rt = tal_ble_server_common_send(&packet);
+    tal_mutex_unlock(sg_notify_mutex);
+    return rt;
 }
 
 BOOL_T openwaifu_ble_fetch_message(char *out, uint16_t out_size)
@@ -297,6 +312,7 @@ OPERATE_RET openwaifu_ble_init(void)
 
     /* 消息缓冲区互斥锁：BLE 任务写、LVGL 任务读 */
     TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_msg_mutex));
+    TUYA_CALL_ERR_RETURN(tal_mutex_create_init(&sg_notify_mutex));
 
     /* 蓝牙依赖 KV 存储、软件定时器与工作队列 */
     TUYA_CALL_ERR_RETURN(tal_kv_init(&(tal_kv_cfg_t){

@@ -53,16 +53,16 @@ void user_main(void)
     openwaifu_ui_init();
     lv_vendor_start(5, 1024 * 8);
 
-    /* 仅启用端侧“你好涂鸦”关键词检测，不启动云端 AI 对话。 */
-    if (openwaifu_wakeup_init() != OPRT_OK) {
-        PR_ERR("Local wake word init failed, continuing without wakeup");
-    }
-
     /* 初始化 BLE 从机并开始广播；失败时不影响界面显示 */
     if (openwaifu_ble_init() != OPRT_OK) {
         PR_ERR("BLE init failed, continuing without BLE");
     } else {
         PR_NOTICE("OpenWaifu BLE Peripheral initialized");
+    }
+
+    /* 仅启用端侧“你好涂鸦”关键词检测，不启动云端 AI 对话。 */
+    if (openwaifu_wakeup_init() != OPRT_OK) {
+        PR_ERR("Local wake word init failed, continuing without wakeup");
     }
 
     /* 初始化 WiFi STA（依赖 BLE init 中完成的 KV 初始化）；

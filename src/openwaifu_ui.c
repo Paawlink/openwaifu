@@ -132,6 +132,7 @@ typedef struct {
     bool        done;        /* 收到 idle/完成后置位 */
     ui_vis_t    vis;         /* 缓存的可视档位，用于判断是否需要重建行 */
     lv_obj_t   *row;         /* 行容器（reconcile 时复用，避免重建导致 indicator 闪烁） */
+    lv_obj_t   *plugin_icon; /* 插件图标（plugin 变化时原地替换） */
     lv_obj_t   *title_label; /* 任务主题标签（可就地更新文本） */
     lv_obj_t   *indicator;   /* 状态指示灯（vis 变化时原地替换） */
     uint32_t    elapsed;     /* 运行时长（秒），详情页展示 */
@@ -206,6 +207,7 @@ static void __avatar_trigger_event(openwaifu_avatar_state_t state);
 static void __avatar_update_base(void);
 /* 前向声明：指示灯构建函数在视图构建小节定义，此处先声明以供会话更新逻辑原地替换。 */
 static lv_obj_t *__make_indicator(lv_obj_t *parent, ui_vis_t vis);
+static lv_obj_t *__make_icon(lv_obj_t *parent, const char *plugin);
 
 /** 手写的有界字符串拷贝（避免引入额外依赖，保证以 '\0' 结尾）。 */
 static void __str_copy(char *dst, const char *src, uint32_t cap)
@@ -316,6 +318,7 @@ static ui_session_t *__alloc_session(const char *sid)
             if (sg_sessions[i].row != NULL) {
                 lv_obj_delete(sg_sessions[i].row);
                 sg_sessions[i].row       = NULL;
+                sg_sessions[i].plugin_icon = NULL;
                 sg_sessions[i].title_label = NULL;
                 sg_sessions[i].indicator   = NULL;
             }
@@ -360,8 +363,10 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 {
     ui_session_t *s      = __find_session(sid);
     bool          is_new = false;
+    bool          plugin_changed;
     ui_vis_t      new_vis;
     char          old_body[OPENWAIFU_UI_TASK_LEN];
+    const char   *new_plugin = (plugin != NULL && plugin[0] != '\0') ? plugin : "agent";
 
     if (s == NULL) {
         s = __alloc_session(sid);
@@ -384,8 +389,8 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
         old_body[0] = '\0';
     }
 
-    __str_copy(s->plugin, (plugin != NULL && plugin[0] != '\0') ? plugin : "agent",
-               sizeof(s->plugin));
+    plugin_changed = strcmp(s->plugin, new_plugin) != 0;
+    __str_copy(s->plugin, new_plugin, sizeof(s->plugin));
     __str_copy(s->task, task != NULL ? task : "", sizeof(s->task));
     {
         s->status = st;
@@ -422,15 +427,25 @@ static void __upsert_session(const char *sid, ui_status_t st, uint32_t elapsed,
 
         if (need_rebuild) {
             sg_structure_dirty = true;
-        } else if (s->title_label != NULL) {
-            const char *body = s->task[0] != '\0' ? s->task
-                                                  : (s->plugin[0] != '\0' ? s->plugin : "—");
-            /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
-             * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
-             * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
-             * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
-            if (strcmp(old_body, body) != 0) {
-                lv_label_set_text(s->title_label, body);
+        } else {
+            if (plugin_changed && s->row != NULL) {
+                if (s->plugin_icon != NULL) {
+                    lv_obj_delete(s->plugin_icon);
+                }
+                s->plugin_icon = __make_icon(s->row, s->plugin);
+                lv_obj_move_to_index(s->plugin_icon, 0);
+            }
+
+            if (s->title_label != NULL) {
+                const char *body = s->task[0] != '\0' ? s->task
+                                                      : (s->plugin[0] != '\0' ? s->plugin : "—");
+                /* 后端每 2s 全量下发一帧，多数情况下文本并未变化。仅在与上次显示的
+                 * 主体文本不同时才更新：lv_label_set_text 即便文本相同也会 invalidate +
+                 * 触发布局重算，叠加本屏软件旋转（ROTATION_90）重绘，会表现为“整体每隔
+                 * 几秒跳一下”。这样既消除周期性重绘，也不打断运行中指示弧的动画。 */
+                if (strcmp(old_body, body) != 0) {
+                    lv_label_set_text(s->title_label, body);
+                }
             }
         }
     }
@@ -882,6 +897,7 @@ static void __rebuild_list(void)
         if (!sg_sessions[i].used && sg_sessions[i].row != NULL) {
             lv_obj_delete(sg_sessions[i].row);
             sg_sessions[i].row         = NULL;
+            sg_sessions[i].plugin_icon = NULL;
             sg_sessions[i].title_label = NULL;
             sg_sessions[i].indicator   = NULL;
         }
@@ -951,7 +967,7 @@ static void __rebuild_list(void)
             lv_obj_add_event_cb(row, __row_click_cb, LV_EVENT_CLICKED, s);
 
             /* 插件图标（左，定宽彩色方块） */
-            __make_icon(row, s->plugin);
+            s->plugin_icon = __make_icon(row, s->plugin);
 
             /* 任务主题（主体，占据剩余空间，超长省略）。任务为空时回退到插件名，
              * 避免主体长期只显示占位符。 */

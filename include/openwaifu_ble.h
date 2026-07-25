@@ -80,6 +80,18 @@ void openwaifu_ble_set_subscribe_cb(OPENWAIFU_BLE_SUBSCRIBE_CB cb);
  */
 OPERATE_RET openwaifu_ble_notify(const char *line);
 
+/**
+ * @brief 通过 Notify 特征发送二进制数据。
+ *
+ * 用于传输带协议头的音频分片。调用会与文本通知串行化，避免不同任务同时
+ * 操作同一 Notify 特征。
+ *
+ * @param data 二进制数据。
+ * @param len  数据长度，不得超过 OPENWAIFU_BLE_MAX_MSG_LEN。
+ * @return OPRT_OK 表示已提交发送，其他值表示未发送。
+ */
+OPERATE_RET openwaifu_ble_notify_data(const uint8_t *data, uint16_t len);
+
 #ifdef __cplusplus
 }
 #endif
